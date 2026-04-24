@@ -22,7 +22,7 @@ pm_handle_t pm_create(int mesh_x, int mesh_y, int fps, int texture_size,
     settings.smoothPresetDuration = smooth_duration;
     settings.presetDuration = preset_duration;
     settings.beatSensitivity = beat_sensitivity;
-    settings.shuffleEnabled = true;
+    settings.shuffleEnabled = false;
     try {
         return static_cast<void*>(new projectM(settings, projectM::FLAG_NONE));
     } catch (...) {

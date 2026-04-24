@@ -4,12 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sdl2 = "0.38"
 gl = "0.14"
 cpal = "0.17"
 crossbeam-channel = "0.5"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSArray"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSArray", "NSGeometry", "NSDate", "NSObjCRuntime",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSWindow", "NSView", "NSOpenGL", "NSEvent", "NSResponder",
+    "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSRunningApplication",
+    "NSControl", "NSPanel", "NSGraphics", "objc2-core-foundation",
+] }
+objc2-core-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
 serde = { version = "1", features = ["derive"] }

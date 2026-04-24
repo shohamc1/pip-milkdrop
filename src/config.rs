@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -12,6 +13,10 @@ pub struct Config {
     pub start_at_login: bool,
     #[serde(default)]
     pub locked_preset_index: Option<usize>,
+    #[serde(default)]
+    pub favorites: HashSet<String>,
+    #[serde(default = "default_shuffle_mode")]
+    pub shuffle_mode: ShuffleMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +26,13 @@ pub enum Sensitivity {
     High,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShuffleMode {
+    Off,
+    All,
+    Favorites,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -28,6 +40,8 @@ impl Default for Config {
             hide_delay_secs: default_hide_delay(),
             start_at_login: false,
             locked_preset_index: None,
+            favorites: HashSet::new(),
+            shuffle_mode: default_shuffle_mode(),
         }
     }
 }
@@ -38,6 +52,10 @@ fn default_sensitivity() -> Sensitivity {
 
 fn default_hide_delay() -> u64 {
     4
+}
+
+fn default_shuffle_mode() -> ShuffleMode {
+    ShuffleMode::Off
 }
 
 impl Config {

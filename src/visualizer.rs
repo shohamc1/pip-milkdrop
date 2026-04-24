@@ -64,10 +64,28 @@ impl Visualizer {
         }
     }
 
+    pub fn select_preset(&self, index: u32) {
+        unsafe {
+            ffi::pm_select_preset(self.handle, index, true);
+        }
+    }
+
     pub fn select_next(&self) {
         unsafe {
             ffi::pm_select_next(self.handle, true);
         }
+    }
+
+    pub fn select_random_from(&self, indices: &[u32]) {
+        if indices.is_empty() {
+            return;
+        }
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let i = (ns as usize) % indices.len();
+        self.select_preset(indices[i]);
     }
 
     pub fn select_previous(&self) {
