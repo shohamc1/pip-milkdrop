@@ -15,15 +15,16 @@ use controller::{Controller, Visibility};
 use visualizer::Visualizer;
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::AnyObject;
 use objc2::{class, define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
-    NSFloatingWindowLevel, NSOpenGLContext, NSOpenGLContextParameter,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask,
+    NSFloatingWindowLevel,
+    NSOpenGLContext, NSOpenGLContextParameter,
     NSOpenGLPFAAlphaSize, NSOpenGLPFADepthSize, NSOpenGLPFADoubleBuffer, NSOpenGLPFAColorSize,
     NSOpenGLPFAOpenGLProfile, NSOpenGLPixelFormat, NSOpenGLProfileVersion3_2Core, NSView,
     NSWindow, NSWindowStyleMask,
@@ -36,15 +37,6 @@ use crate::menubar::MenuBar;
 
 const DEFAULT_W: f64 = 240.0;
 const DEFAULT_H: f64 = 240.0;
-
-const SCROLL_TAG: i32 = 1;
-const DRAG_START_TAG: i32 = 2;
-const DRAG_MOVE_TAG: i32 = 3;
-const DRAG_END_TAG: i32 = 4;
-
-static PENDING_VIEW_EVENT: AtomicI32 = AtomicI32::new(0);
-static PENDING_DX: AtomicI32 = AtomicI32::new(0);
-static PENDING_DY: AtomicI32 = AtomicI32::new(0);
 
 extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
@@ -59,36 +51,10 @@ define_class!(
         fn accepts_first_responder(&self) -> bool {
             true
         }
-
-        #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, _event: &NSEvent) {
-            PENDING_VIEW_EVENT.store(DRAG_START_TAG, Ordering::Relaxed);
-        }
-
-        #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) {
-            PENDING_VIEW_EVENT.store(DRAG_END_TAG, Ordering::Relaxed);
-        }
-
-        #[unsafe(method(mouseDragged:))]
-        fn mouse_dragged(&self, event: &NSEvent) {
-            let dx = event.deltaX() as i32;
-            let dy = event.deltaY() as i32;
-            PENDING_DX.store(dx, Ordering::Relaxed);
-            PENDING_DY.store(dy, Ordering::Relaxed);
-            PENDING_VIEW_EVENT.store(DRAG_MOVE_TAG, Ordering::Relaxed);
-        }
-
-        #[unsafe(method(scrollWheel:))]
-        fn scroll_wheel(&self, event: &NSEvent) {
-            let dy = event.scrollingDeltaY() as i32;
-            PENDING_DY.store(dy, Ordering::Relaxed);
-            PENDING_VIEW_EVENT.store(SCROLL_TAG, Ordering::Relaxed);
-        }
     }
 );
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let config = Config::load();
     eprintln!(
         "[pip-milkdrop] Config: sens={:?} delay={}s",
@@ -136,11 +102,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CGSize::new(DEFAULT_W, DEFAULT_H),
     );
 
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Resizable
+        | NSWindowStyleMask::FullSizeContentView;
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
             window_rect,
-            NSWindowStyleMask::Borderless,
+            style,
             NSBackingStoreType::Buffered,
             false,
         )
@@ -149,10 +118,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     window.setLevel(NSFloatingWindowLevel);
     window.setOpaque(true);
     window.setHasShadow(true);
+    window.setMinSize(CGSize::new(100.0, 100.0));
+    window.setMaxSize(CGSize::new(800.0, 800.0));
     unsafe {
         let _: () = msg_send![&window, setReleasedWhenClosed: false];
-        let _: () = msg_send![&window, setIgnoresMouseEvents: false];
-        let _: () = msg_send![&window, setMovableByWindowBackground: false];
+        let _: () = msg_send![&window, setTitlebarAppearsTransparent: true];
+        let _: () = msg_send![&window, setTitleVisibility: 1u64]; // NSWindowTitleHidden
+        let _: () = msg_send![&window, setMovableByWindowBackground: true];
+        let _: () = msg_send![&window, setShowsResizeIndicator: false];
+        let btn: Option<Retained<AnyObject>> = msg_send![&window, standardWindowButton: 0u64]; // NSWindowCloseButton
+        if let Some(b) = btn {
+            let _: () = msg_send![&b, setHidden: true];
+        }
+        let btn: Option<Retained<AnyObject>> = msg_send![&window, standardWindowButton: 1u64]; // NSWindowMiniaturizeButton
+        if let Some(b) = btn {
+            let _: () = msg_send![&b, setHidden: true];
+        }
+        let btn: Option<Retained<AnyObject>> = msg_send![&window, standardWindowButton: 2u64]; // NSWindowZoomButton
+        if let Some(b) = btn {
+            let _: () = msg_send![&b, setHidden: true];
+        }
     }
 
     let viz_view: Retained<VizView> = unsafe {
@@ -192,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pixel_h = (DEFAULT_H * scale) as u32;
 
     let preset_path = "/opt/homebrew/share/projectM/presets/presets_stock";
-    let viz = Visualizer::new(pixel_w, pixel_h, preset_path)?;
+    let viz = Visualizer::new(pixel_w, pixel_h, preset_path).expect("Failed to create visualizer");
 
     ctx.update(mtm);
     eprintln!(
@@ -206,8 +191,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut gallery: Option<Gallery> = None;
 
-    let mut capture = AudioCapture::new()?;
-    capture.start()?;
+    let mut capture = AudioCapture::new().expect("Failed to create audio capture");
+    capture.start().expect("Failed to start audio capture");
 
     media::start_polling();
     eprintln!("[pip-milkdrop] Media polling started.");
@@ -216,10 +201,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = config;
 
     let mut visible = false;
-    let mut dragging = false;
     let mut last_status = Instant::now();
     let mut total_buffers = 0u64;
-    let mut need_resize = false;
+    let mut last_frame = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0));
     #[allow(unused_assignments)]
     let mut viz_pixel_w = pixel_w as i32;
     #[allow(unused_assignments)]
@@ -229,8 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let distant_past = NSDate::distantPast();
 
-    let mut running = true;
-    while running {
+    loop {
         autoreleasepool(|_| {
             loop {
                 let event = app.nextEventMatchingMask_untilDate_inMode_dequeue(
@@ -244,49 +227,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        loop {
-            let tag = PENDING_VIEW_EVENT.swap(0, Ordering::Relaxed);
-            if tag == 0 {
-                break;
-            }
-            match tag {
-                DRAG_START_TAG => {
-                    dragging = true;
-                }
-                DRAG_END_TAG => {
-                    dragging = false;
-                }
-                DRAG_MOVE_TAG => {
-                    if dragging {
-                        let dx = PENDING_DX.load(Ordering::Relaxed) as f64;
-                        let dy = PENDING_DY.load(Ordering::Relaxed) as f64;
-                        let frame = window.frame();
-                        let new_origin =
-                            CGPoint::new(frame.origin.x + dx, frame.origin.y - dy);
-                        window.setFrameOrigin(new_origin);
-                    }
-                }
-                t if t == SCROLL_TAG => {
-                    let dy = PENDING_DY.load(Ordering::Relaxed) as f64;
-                    let scale = if dy > 0.0 { 1.15f64 } else { 1.0 / 1.15 };
-                    let frame = window.frame();
-                    let nw = (frame.size.width * scale).clamp(100.0, 800.0);
-                    let nh = (frame.size.height * scale).clamp(100.0, 800.0);
-                    let new_x = frame.origin.x + (frame.size.width - nw) / 2.0;
-                    let new_y = frame.origin.y + (frame.size.height - nh) / 2.0;
-                    let new_frame =
-                        CGRect::new(CGPoint::new(new_x, new_y), CGSize::new(nw, nh));
-                    window.setFrame_display(new_frame, true);
-                    need_resize = true;
-                }
-                _ => {}
-            }
-        }
-
         let action = menubar.handle_pending_action(&mut config, &viz);
         if action == -1 {
-            running = false;
-            continue;
+            unsafe {
+                let _: () = msg_send![&app, terminate: std::ptr::null::<AnyObject>()];
+            }
+            std::process::exit(0);
         }
         if action == menubar::TAG_BROWSE as i32 {
             if gallery.is_none() {
@@ -335,14 +281,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if need_resize {
+        if audio::DEVICE_CHANGED.swap(false, Ordering::Relaxed) {
+            eprintln!("[pip-milkdrop] Audio device changed, restarting capture...");
+            if let Err(e) = capture.restart() {
+                eprintln!("[pip-milkdrop] Failed to restart audio capture: {e}");
+            }
+        }
+
+        let frame = window.frame();
+        if frame.size.width != last_frame.size.width || frame.size.height != last_frame.size.height {
             let view_bounds: CGRect = unsafe { msg_send![&viz_view, bounds] };
             let scale = window.backingScaleFactor();
             viz_pixel_w = (view_bounds.size.width * scale) as i32;
             viz_pixel_h = (view_bounds.size.height * scale) as i32;
             viz.reset_gl(viz_pixel_w, viz_pixel_h);
             ctx.update(mtm);
-            need_resize = false;
+            last_frame = frame;
         }
 
         let mut latest_rms = 0.0f32;
@@ -397,7 +351,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Hover preview: render hovered preset into card's image view
         if hover_active {
             let hover_idx = hover as usize;
             if let Some(ref mut g) = gallery {
@@ -414,7 +367,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-
-    capture.stop();
-    Ok(())
 }

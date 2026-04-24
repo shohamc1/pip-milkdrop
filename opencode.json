@@ -4,5 +4,11 @@
     "*": {
       "*": "allow",
     }
+  },
+  "mcp": {
+    "ferroscope": {
+	"type": "local",
+      "command": ["ferroscope"],
+    }
   }
 }
