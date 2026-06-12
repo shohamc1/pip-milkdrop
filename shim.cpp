@@ -84,4 +84,10 @@ void pm_populate_preset_menu(pm_handle_t handle) {
     static_cast<projectM*>(handle)->populatePresetMenu();
 }
 
+unsigned int pm_add_preset_url(pm_handle_t handle, const char* url, const char* name) {
+    typedef std::vector<int> RatingList;
+    RatingList ratings(3, 0);
+    return static_cast<projectM*>(handle)->addPresetURL(std::string(url), std::string(name), ratings);
+}
+
 }

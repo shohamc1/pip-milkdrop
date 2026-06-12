@@ -7,8 +7,8 @@ pub struct Visualizer {
 impl Visualizer {
     pub fn new(width: u32, height: u32, preset_path: &str) -> Result<Self, String> {
         let c_preset = std::ffi::CString::new(preset_path).map_err(|e| e.to_string())?;
-        let c_datadir = std::ffi::CString::new("/opt/homebrew/share/projectM")
-            .map_err(|e| e.to_string())?;
+        let c_datadir =
+            std::ffi::CString::new(env!("PROJECTM_DATADIR")).map_err(|e| e.to_string())?;
 
         let handle = unsafe {
             ffi::pm_create(
@@ -67,6 +67,7 @@ impl Visualizer {
     pub fn select_preset(&self, index: u32) {
         unsafe {
             ffi::pm_select_preset(self.handle, index, true);
+            ffi::pm_set_preset_lock(self.handle, true);
         }
     }
 
@@ -105,6 +106,37 @@ impl Visualizer {
                 return String::new();
             }
             std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    }
+
+    pub fn load_user_presets(&self, dir: &str) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "milk" && ext != "milk2" && ext != "prjm" {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let url = path.to_string_lossy().into_owned();
+            let c_url = match std::ffi::CString::new(url.as_str()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let c_name = match std::ffi::CString::new(name.as_str()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            unsafe {
+                ffi::pm_add_preset_url(self.handle, c_url.as_ptr(), c_name.as_ptr());
+            }
         }
     }
 

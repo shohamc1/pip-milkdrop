@@ -1,14 +1,18 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{class, define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{
+    class, define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSView, NSWindow,
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_graphics::CGColor;
 use objc2_foundation::NSString;
 
 use crate::visualizer::Visualizer;
@@ -18,6 +22,9 @@ pub static GALLERY_HOVER: AtomicI32 = AtomicI32::new(-1);
 
 pub const GA_SEARCH: i32 = 1;
 pub const GA_CLEAR: i32 = 2;
+pub const GA_TAB_ALL: i32 = 3;
+pub const GA_TAB_FAV: i32 = 4;
+pub const GA_SECTION_BASE: i32 = 100;
 pub const GA_SELECT_BASE: i32 = 1000;
 pub const GA_FAV_BASE: i32 = 5000;
 
@@ -30,6 +37,7 @@ const PAD: f64 = 8.0;
 const COLS: usize = 5;
 const WARMUP_INITIAL: usize = 8;
 const FRAMES_PER_TICK: usize = 2;
+const SECTION_HEADER_H: f64 = 28.0;
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -51,6 +59,16 @@ define_class!(
         #[unsafe(method(clearClicked:))]
         fn clear_clicked(&self, _sender: Option<&AnyObject>) {
             GALLERY_ACTION.store(GA_CLEAR, Ordering::Relaxed);
+        }
+
+        #[unsafe(method(tabAllClicked:))]
+        fn tab_all_clicked(&self, _sender: Option<&AnyObject>) {
+            GALLERY_ACTION.store(GA_TAB_ALL, Ordering::Relaxed);
+        }
+
+        #[unsafe(method(tabFavClicked:))]
+        fn tab_fav_clicked(&self, _sender: Option<&AnyObject>) {
+            GALLERY_ACTION.store(GA_TAB_FAV, Ordering::Relaxed);
         }
     }
 );
@@ -83,6 +101,29 @@ define_class!(
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &objc2_app_kit::NSEvent) {
             GALLERY_HOVER.store(-1, Ordering::Relaxed);
+        }
+    }
+);
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[ivars = (usize,)]
+    struct SectionHeaderView;
+
+    impl SectionHeaderView {
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
+            let section_idx = self.ivars().0;
+            GALLERY_ACTION.store(GA_SECTION_BASE + section_idx as i32, Ordering::Relaxed);
+        }
+
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            unsafe {
+                let cursor: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
+                let bounds: CGRect = msg_send![self, bounds];
+                let () = msg_send![self, addCursorRect: bounds cursor: cursor];
+            }
         }
     }
 );
@@ -179,12 +220,66 @@ fn capture_gl_image() -> Option<Retained<AnyObject>> {
     unsafe { create_nsimage_from_pixels(&flipped, read_w, read_h) }
 }
 
+fn thumbnail_path(dir: &PathBuf, name: &str) -> PathBuf {
+    let safe = name.replace('/', "_").replace('\\', "_").replace(':', "_");
+    dir.join(format!("{safe}.rgba"))
+}
+
+fn save_thumbnail(dir: &PathBuf, name: &str, image: &AnyObject) {
+    let path = thumbnail_path(dir, name);
+    unsafe {
+        let size: CGSize = msg_send![image, size];
+        let w = size.width as usize;
+        let h = size.height as usize;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let reps: *mut AnyObject = msg_send![image, representations];
+        let count: usize = msg_send![reps, count];
+        for i in 0..count {
+            let rep: *mut AnyObject = msg_send![reps, objectAtIndex: i];
+            let data_ptr: *mut u8 = msg_send![rep, bitmapData];
+            if data_ptr.is_null() {
+                continue;
+            }
+            let pixels = std::slice::from_raw_parts(data_ptr, w * h * 4);
+            let mut out = Vec::with_capacity(8 + w * h * 4);
+            out.extend_from_slice(&(w as u32).to_le_bytes());
+            out.extend_from_slice(&(h as u32).to_le_bytes());
+            out.extend_from_slice(pixels);
+            let _ = std::fs::write(&path, out);
+            return;
+        }
+    }
+}
+
+fn load_thumbnail(dir: &PathBuf, name: &str) -> Option<Retained<AnyObject>> {
+    let path = thumbnail_path(dir, name);
+    let data = std::fs::read(&path).ok()?;
+    if data.len() < 8 {
+        return None;
+    }
+    let w = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let h = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+    if data.len() != 8 + w * h * 4 {
+        return None;
+    }
+    unsafe { create_nsimage_from_pixels(&data[8..], w, h) }
+}
+
 struct Card {
     view: Retained<CardView>,
     image_view: Retained<AnyObject>,
     #[allow(dead_code)]
     name_label: Retained<AnyObject>,
     fav_button: Retained<AnyObject>,
+}
+
+struct SectionInfo {
+    id: usize,
+    label: &'static str,
+    start: usize,
+    count: usize,
 }
 
 pub struct Gallery {
@@ -203,6 +298,14 @@ pub struct Gallery {
     favorites: HashSet<String>,
     filter: Option<String>,
     is_open: bool,
+    stock_count: usize,
+    section_views: Vec<Retained<SectionHeaderView>>,
+    section_labels: Vec<Retained<AnyObject>>,
+    collapsed_sections: HashSet<usize>,
+    show_favorites_only: bool,
+    tab_all_btn: Retained<AnyObject>,
+    tab_fav_btn: Retained<AnyObject>,
+    thumbnail_dir: PathBuf,
 
     sim_time: f64,
     current_preview: Option<usize>,
@@ -210,11 +313,41 @@ pub struct Gallery {
     saved_preset: u32,
     initial_queue: Vec<usize>,
     initial_queued: HashSet<usize>,
+    last_layout_w: f64,
+    last_layout_h: f64,
 }
 
 impl Gallery {
+    fn sections(&self) -> Vec<SectionInfo> {
+        let mut sections = Vec::new();
+        if self.stock_count > 0 {
+            sections.push(SectionInfo {
+                id: 0,
+                label: "Stock Presets",
+                start: 0,
+                count: self.stock_count,
+            });
+        }
+        let user_count = self.all_presets.len().saturating_sub(self.stock_count);
+        if user_count > 0 {
+            sections.push(SectionInfo {
+                id: 1,
+                label: "My Presets",
+                start: self.stock_count,
+                count: user_count,
+            });
+        }
+        sections
+    }
+
+    fn section_header_title(label: &str, collapsed: bool) -> String {
+        let arrow = if collapsed { "\u{25B6}" } else { "\u{25BE}" };
+        format!("{arrow} {label}")
+    }
+
     pub fn new(
         presets: &[String],
+        stock_count: usize,
         favorites: &HashSet<String>,
         active_index: usize,
         mtm: MainThreadMarker,
@@ -224,6 +357,14 @@ impl Gallery {
         let fav_sel = sel!(favClicked:);
         let search_sel = sel!(searchClicked:);
         let clear_sel = sel!(clearClicked:);
+        let tab_all_sel = sel!(tabAllClicked:);
+        let tab_fav_sel = sel!(tabFavClicked:);
+
+        let thumbnail_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("pip-milkdrop")
+            .join("thumbnails");
+        let _ = std::fs::create_dir_all(&thumbnail_dir);
 
         let win_w = 900.0;
         let win_h = 700.0;
@@ -267,7 +408,12 @@ impl Gallery {
             )];
             let tf = Retained::from_raw(tf).unwrap();
             let () = msg_send![&*tf, setEditable: true];
-            let () = msg_send![&*tf, setPlaceholderString: &*NSString::from_str("Filter presets...")];
+            let () =
+                msg_send![&*tf, setPlaceholderString: &*NSString::from_str("Filter presets...")];
+            let () = msg_send![&*tf, setTarget: handler_ref];
+            let () = msg_send![&*tf, setAction: search_sel];
+            // Make Return in the search field apply the filter; the explicit button remains
+            // for discoverability.
             let () = msg_send![&*tf, setAutoresizingMask: 10usize];
             tf
         };
@@ -311,7 +457,45 @@ impl Gallery {
             let () = msg_send![&*content_view, addSubview: &*clear_btn];
         }
 
-        let grid_h = search_y - PAD;
+        let tab_h = 26.0;
+        let tab_y = search_y - tab_h - 4.0;
+        let tab_all_btn: Retained<AnyObject> = unsafe {
+            let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
+                CGPoint::new(PAD, tab_y),
+                CGSize::new(80.0, tab_h),
+            )];
+            let btn = Retained::from_raw(btn).unwrap();
+            let () = msg_send![&*btn, setTitle: &*NSString::from_str("All")];
+            let () = msg_send![&*btn, setTarget: handler_ref];
+            let () = msg_send![&*btn, setAction: tab_all_sel];
+            let () = msg_send![&*btn, setBezelStyle: 1isize];
+            let () = msg_send![&*btn, setAutoresizingMask: 10usize];
+            btn
+        };
+        unsafe {
+            let () = msg_send![&*content_view, addSubview: &*tab_all_btn];
+        }
+
+        let tab_fav_btn: Retained<AnyObject> = unsafe {
+            let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
+                CGPoint::new(PAD + 86.0, tab_y),
+                CGSize::new(100.0, tab_h),
+            )];
+            let btn = Retained::from_raw(btn).unwrap();
+            let () = msg_send![&*btn, setTitle: &*NSString::from_str("Favorites")];
+            let () = msg_send![&*btn, setTarget: handler_ref];
+            let () = msg_send![&*btn, setAction: tab_fav_sel];
+            let () = msg_send![&*btn, setBezelStyle: 1isize];
+            let () = msg_send![&*btn, setAutoresizingMask: 10usize];
+            btn
+        };
+        unsafe {
+            let () = msg_send![&*content_view, addSubview: &*tab_fav_btn];
+        }
+
+        let grid_h = tab_y - PAD;
         let scroll_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(win_w, grid_h));
         let scroll_view: Retained<AnyObject> = unsafe {
             let sv: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
@@ -327,19 +511,6 @@ impl Gallery {
         }
 
         let total = presets.len();
-        let rows = (total + COLS - 1) / COLS;
-        let doc_h = PAD + rows as f64 * (CARD_H + PAD);
-        let doc_w = COLS as f64 * (CARD_W + PAD) + PAD;
-        let doc_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(doc_w, doc_h));
-        let document_view: Retained<AnyObject> = unsafe {
-            let dv: *mut AnyObject = msg_send![class!(NSView), alloc];
-            let dv: *mut AnyObject = msg_send![dv, initWithFrame: doc_rect];
-            Retained::from_raw(dv).unwrap()
-        };
-        unsafe {
-            let () = msg_send![&*scroll_view, setDocumentView: &*document_view];
-        }
-
         let small_font: Retained<AnyObject> =
             unsafe { msg_send![class!(NSFont), systemFontOfSize: 11.0] };
         let star_font: Retained<AnyObject> =
@@ -348,12 +519,7 @@ impl Gallery {
 
         let mut cards = Vec::with_capacity(total);
         for (i, name) in presets.iter().enumerate() {
-            let row = i / COLS;
-            let col = i % COLS;
-            let x = PAD + col as f64 * (CARD_W + PAD);
-            let y = doc_h - PAD - row as f64 * (CARD_H + PAD) - CARD_H;
-            let card_rect = CGRect::new(CGPoint::new(x, y), CGSize::new(CARD_W, CARD_H));
-
+            let card_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(CARD_W, CARD_H));
             let card_view: Retained<CardView> = unsafe {
                 let view = CardView::alloc(mtm).set_ivars((i,));
                 msg_send![super(view), initWithFrame: card_rect]
@@ -364,7 +530,7 @@ impl Gallery {
                 let () = msg_send![layer, setCornerRadius: 6.0];
                 let () = msg_send![layer, setMasksToBounds: true];
                 let bg: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 0.12, green: 0.12, blue: 0.14, alpha: 1.0];
-                let cg: *mut AnyObject = msg_send![&*bg, CGColor];
+                let cg: *mut CGColor = msg_send![&*bg, CGColor];
                 let () = msg_send![layer, setBackgroundColor: cg];
 
                 let bounds: CGRect = msg_send![&*card_view, bounds];
@@ -408,17 +574,22 @@ impl Gallery {
                 let () = msg_send![&*tf, setFont: &*small_font];
                 let () = msg_send![&*tf, setTextColor: white_color];
                 let () = msg_send![&*tf, setAlignment: 0isize];
-                let () = msg_send![&*tf, setLineBreakMode: 0isize];
+                let () = msg_send![&*tf, setUsesSingleLineMode: false];
+                let () = msg_send![&*tf, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
                 let clean = name.strip_suffix(".milk").unwrap_or(name);
                 let display_name = clean.to_string();
                 let () = msg_send![&*tf, setStringValue: &*NSString::from_str(&display_name)];
+                let () = msg_send![&*tf, setToolTip: &*NSString::from_str(&display_name)];
                 tf
             };
             unsafe {
                 let () = msg_send![&*card_view, addSubview: &*name_label];
             }
 
-            let fav_rect = CGRect::new(CGPoint::new(CARD_W - 26.0, IMG_SIZE + 40.0 - 24.0), CGSize::new(24.0, 24.0));
+            let fav_rect = CGRect::new(
+                CGPoint::new(CARD_W - 26.0, IMG_SIZE + 40.0 - 24.0),
+                CGSize::new(24.0, 24.0),
+            );
             let is_fav = favorites.contains(name);
             let fav_button: Retained<AnyObject> = unsafe {
                 let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
@@ -445,20 +616,38 @@ impl Gallery {
             });
         }
 
-        for card in &cards {
-            unsafe {
-                let () = msg_send![&*document_view, addSubview: &*card.view];
+        let doc_w = COLS as f64 * (CARD_W + PAD) + PAD;
+        let doc_h = 1.0f64;
+        let doc_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(doc_w, doc_h));
+        let document_view: Retained<AnyObject> = unsafe {
+            let dv: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let dv: *mut AnyObject = msg_send![dv, initWithFrame: doc_rect];
+            Retained::from_raw(dv).unwrap()
+        };
+        unsafe {
+            let () = msg_send![&*scroll_view, setDocumentView: &*document_view];
+        }
+
+        let mut preview_images: Vec<Option<Retained<AnyObject>>> = vec![None; total];
+        let mut cached_set = HashSet::new();
+        for (i, name) in presets.iter().enumerate() {
+            if let Some(img) = load_thumbnail(&thumbnail_dir, name) {
+                if i < cards.len() {
+                    unsafe {
+                        let () = msg_send![&*cards[i].image_view, setImage: &*img];
+                    }
+                }
+                preview_images[i] = Some(img);
+                cached_set.insert(i);
             }
         }
+        eprintln!(
+            "[pip-milkdrop] Loaded {}/{} cached thumbnails",
+            cached_set.len(),
+            total
+        );
 
-        let preview_images = vec![None; total];
-
-        let mut initial_queue = Vec::new();
-        let mut initial_queued = HashSet::new();
-        for idx in 0..total {
-            initial_queued.insert(idx);
-            initial_queue.push(idx);
-        }
+        let collapsed_sections = HashSet::new();
 
         let visible_indices: Vec<usize> = (0..total).collect();
 
@@ -476,27 +665,230 @@ impl Gallery {
             favorites: favorites.clone(),
             filter: None,
             is_open: false,
+            stock_count,
+            section_views: Vec::new(),
+            section_labels: Vec::new(),
+            collapsed_sections,
+            show_favorites_only: false,
+            tab_all_btn,
+            tab_fav_btn,
+            thumbnail_dir,
             sim_time: 0.0,
             current_preview: None,
             preview_frames: 0,
             saved_preset: 0,
-            initial_queue,
-            initial_queued,
+            initial_queue: Vec::new(),
+            initial_queued: HashSet::new(),
+            last_layout_w: 0.0,
+            last_layout_h: 0.0,
         };
+
+        gallery.relayout();
+
+        let mut initial_queue = Vec::new();
+        let mut initial_queued = HashSet::new();
+        for idx in 0..total {
+            if !cached_set.contains(&idx) {
+                initial_queued.insert(idx);
+                initial_queue.push(idx);
+            }
+        }
+        gallery.initial_queue = initial_queue;
+        gallery.initial_queued = initial_queued;
+
         gallery.update_active(active_index);
+        gallery.update_tab_style();
         gallery
     }
 
-    pub fn show(&mut self) {
-        let mtm = MainThreadMarker::new().unwrap();
-        let app = NSApplication::sharedApplication(mtm);
-        unsafe {
-            let () = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
-            let () = msg_send![&app, activateIgnoringOtherApps: true];
+    fn relayout(&mut self) {
+        for card in &self.cards {
+            unsafe {
+                let () = msg_send![&*card.view, removeFromSuperview];
+            }
         }
-        self.window.makeKeyAndOrderFront(None);
-        self.is_open = true;
+        for sv in &self.section_views {
+            unsafe {
+                let () = msg_send![&*sv, removeFromSuperview];
+            }
+        }
+        for sl in &self.section_labels {
+            unsafe {
+                let () = msg_send![&*sl, removeFromSuperview];
+            }
+        }
+        self.section_views.clear();
+        self.section_labels.clear();
 
+        let mtm = MainThreadMarker::new().unwrap();
+        let header_font: Retained<AnyObject> =
+            unsafe { msg_send![class!(NSFont), boldSystemFontOfSize: 14.0] };
+        let white_color: *mut AnyObject = unsafe { msg_send![class!(NSColor), whiteColor] };
+
+        let viewport_bounds: CGRect = unsafe { msg_send![&*self.scroll_view, frame] };
+        let viewport_w = viewport_bounds.size.width.max(CARD_W + PAD * 2.0);
+        let cols = ((viewport_w - PAD) / (CARD_W + PAD))
+            .floor()
+            .max(1.0)
+            .min(COLS as f64) as usize;
+        let grid_w = cols as f64 * (CARD_W + PAD) + PAD;
+        let doc_w = viewport_w.max(grid_w);
+
+        let sections = self.sections();
+        let filter_lc = self.filter.as_ref().map(|f| f.to_lowercase());
+        let matching: Vec<usize> = (0..self.all_presets.len())
+            .filter(|&i| {
+                if self.show_favorites_only && !self.favorites.contains(&self.all_presets[i]) {
+                    return false;
+                }
+                filter_lc
+                    .as_ref()
+                    .map_or(true, |f| self.all_presets[i].to_lowercase().contains(f))
+            })
+            .collect();
+
+        let mut filter_sections: Vec<(usize, &str, Vec<usize>)> = Vec::new();
+        for sec in &sections {
+            let sec_matching: Vec<usize> = matching
+                .iter()
+                .copied()
+                .filter(|&i| i >= sec.start && i < sec.start + sec.count)
+                .collect();
+            if !sec_matching.is_empty() {
+                filter_sections.push((sec.id, sec.label, sec_matching));
+            }
+        }
+
+        let mut doc_h = 0.0f64;
+        for (section_id, _, indices) in &filter_sections {
+            let collapsed = self.collapsed_sections.contains(section_id);
+            doc_h += SECTION_HEADER_H;
+            if !collapsed {
+                let rows = (indices.len() + cols - 1) / cols;
+                doc_h += rows as f64 * (CARD_H + PAD) + PAD;
+            } else {
+                doc_h += PAD;
+            }
+        }
+        if filter_sections.is_empty() {
+            doc_h = viewport_bounds.size.height.max(80.0);
+        }
+
+        if filter_sections.is_empty() {
+            let message = if self.show_favorites_only {
+                "No favorite presets yet. Star presets in All to collect them here."
+            } else if self.filter.is_some() {
+                "No presets match this search."
+            } else {
+                "No presets found."
+            };
+            let empty_label: Retained<AnyObject> = unsafe {
+                let tf: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+                let tf: *mut AnyObject = msg_send![tf,
+                    initWithFrame: CGRect::new(
+                        CGPoint::new(PAD, (doc_h - 40.0).max(PAD)),
+                        CGSize::new(doc_w - PAD * 2.0, 32.0)
+                    )
+                ];
+                let tf = Retained::from_raw(tf).unwrap();
+                let () = msg_send![&*tf, setEditable: false];
+                let () = msg_send![&*tf, setSelectable: false];
+                let () = msg_send![&*tf, setBezeled: false];
+                let () = msg_send![&*tf, setDrawsBackground: false];
+                let () = msg_send![&*tf, setAlignment: 1isize];
+                let gray: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+                let () = msg_send![&*tf, setTextColor: gray];
+                let () = msg_send![&*tf, setStringValue: &*NSString::from_str(message)];
+                tf
+            };
+            unsafe {
+                let () = msg_send![&*self.document_view, addSubview: &*empty_label];
+            }
+            self.section_labels.push(empty_label);
+        }
+
+        let mut y_from_top = 0.0f64;
+        let mut displayed = Vec::new();
+        for (section_id, label, indices) in &filter_sections {
+            let collapsed = self.collapsed_sections.contains(section_id);
+            let header_y = doc_h - y_from_top - SECTION_HEADER_H;
+            let header_rect = CGRect::new(
+                CGPoint::new(PAD, header_y),
+                CGSize::new(doc_w - PAD * 2.0, SECTION_HEADER_H),
+            );
+
+            let header_view: Retained<SectionHeaderView> = unsafe {
+                let view = SectionHeaderView::alloc(mtm).set_ivars((*section_id,));
+                msg_send![super(view), initWithFrame: header_rect]
+            };
+
+            let title = Self::section_header_title(label, collapsed);
+            let label_view: Retained<AnyObject> = unsafe {
+                let tf: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+                let tf: *mut AnyObject = msg_send![tf,
+                    initWithFrame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(doc_w - PAD * 2.0, SECTION_HEADER_H))
+                ];
+                let tf = Retained::from_raw(tf).unwrap();
+                let () = msg_send![&*tf, setEditable: false];
+                let () = msg_send![&*tf, setSelectable: false];
+                let () = msg_send![&*tf, setBezeled: false];
+                let () = msg_send![&*tf, setDrawsBackground: false];
+                let () = msg_send![&*tf, setFont: &*header_font];
+                let () = msg_send![&*tf, setTextColor: white_color];
+                let () = msg_send![&*tf, setStringValue: &*NSString::from_str(&title)];
+                tf
+            };
+            unsafe {
+                let () = msg_send![&*header_view, addSubview: &*label_view];
+                let () = msg_send![&*self.document_view, addSubview: &*header_view];
+            }
+            self.section_views.push(header_view);
+            self.section_labels.push(label_view);
+
+            y_from_top += SECTION_HEADER_H;
+
+            if !collapsed {
+                for (gi, &preset_idx) in indices.iter().enumerate() {
+                    let row = gi / cols;
+                    let col = gi % cols;
+                    let x = PAD + col as f64 * (CARD_W + PAD);
+                    let y = doc_h - y_from_top - row as f64 * (CARD_H + PAD) - CARD_H;
+                    let frame = CGRect::new(CGPoint::new(x, y), CGSize::new(CARD_W, CARD_H));
+                    unsafe {
+                        let () = msg_send![&*self.cards[preset_idx].view, setFrame: frame];
+                        let () = msg_send![&*self.document_view, addSubview: &*self.cards[preset_idx].view];
+                    }
+                    displayed.push(preset_idx);
+                }
+                let rows = (indices.len() + cols - 1) / cols;
+                y_from_top += rows as f64 * (CARD_H + PAD) + PAD;
+            } else {
+                y_from_top += PAD;
+            }
+        }
+
+        unsafe {
+            let () = msg_send![&*self.document_view, setFrame: CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(doc_w, doc_h.max(1.0)),
+            )];
+        }
+
+        self.visible_indices = displayed;
+        self.last_layout_w = viewport_bounds.size.width;
+        self.last_layout_h = viewport_bounds.size.height;
+    }
+
+    pub fn sync_layout_to_bounds(&mut self) {
+        let bounds: CGRect = unsafe { msg_send![&*self.scroll_view, frame] };
+        if (bounds.size.width - self.last_layout_w).abs() > 0.5
+            || (bounds.size.height - self.last_layout_h).abs() > 0.5
+        {
+            self.relayout();
+        }
+    }
+
+    fn scroll_to_top(&self) {
         unsafe {
             let clip_view: Retained<AnyObject> = msg_send![&*self.scroll_view, contentView];
             let clip_bounds: CGRect = msg_send![&*clip_view, bounds];
@@ -505,6 +897,63 @@ impl Gallery {
             let () = msg_send![&*clip_view, scrollToPoint: CGPoint::new(0.0, target_y)];
             let () = msg_send![&*self.scroll_view, reflectScrolledClipView: &*clip_view];
         }
+    }
+
+    pub fn toggle_section(&mut self, section_idx: usize) {
+        if self.collapsed_sections.contains(&section_idx) {
+            self.collapsed_sections.remove(&section_idx);
+        } else {
+            self.collapsed_sections.insert(section_idx);
+        }
+        self.relayout();
+        self.scroll_to_top();
+    }
+
+    fn update_tab_style(&self) {
+        let accent: *mut AnyObject = unsafe { msg_send![class!(NSColor), controlColor] };
+        let highlight: *mut AnyObject = unsafe { msg_send![class!(NSColor), selectedControlColor] };
+        unsafe {
+            let active = if self.show_favorites_only {
+                &self.tab_fav_btn
+            } else {
+                &self.tab_all_btn
+            };
+            let inactive = if self.show_favorites_only {
+                &self.tab_all_btn
+            } else {
+                &self.tab_fav_btn
+            };
+            let () = msg_send![&**active, setBezelColor: highlight];
+            let () = msg_send![&**inactive, setBezelColor: accent];
+        }
+    }
+
+    pub fn set_tab_favorites(&mut self) {
+        self.show_favorites_only = true;
+        self.update_tab_style();
+        self.relayout();
+        self.scroll_to_top();
+    }
+
+    pub fn set_tab_all(&mut self) {
+        self.show_favorites_only = false;
+        self.update_tab_style();
+        self.relayout();
+        self.scroll_to_top();
+    }
+
+    pub fn show(&mut self) {
+        let mtm = MainThreadMarker::new().unwrap();
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe {
+            let _: bool =
+                msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
+            let () = msg_send![&app, activateIgnoringOtherApps: true];
+        }
+        self.window.makeKeyAndOrderFront(None);
+        self.is_open = true;
+
+        self.scroll_to_top();
     }
 
     pub fn is_open(&self) -> bool {
@@ -521,7 +970,8 @@ impl Gallery {
             let mtm = MainThreadMarker::new().unwrap();
             let app = NSApplication::sharedApplication(mtm);
             unsafe {
-                let () = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Accessory];
+                let _: bool =
+                    msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Accessory];
             }
         }
     }
@@ -530,6 +980,8 @@ impl Gallery {
         if !self.is_open {
             return;
         }
+
+        self.sync_layout_to_bounds();
 
         if self.current_preview.is_none() {
             if self.initial_queue.is_empty() {
@@ -561,6 +1013,9 @@ impl Gallery {
                         unsafe {
                             let () = msg_send![&*self.cards[idx].image_view, setImage: &*image];
                         }
+                    }
+                    if idx < self.all_presets.len() {
+                        save_thumbnail(&self.thumbnail_dir, &self.all_presets[idx], &image);
                     }
                 }
             }
@@ -606,49 +1061,9 @@ impl Gallery {
 
     pub fn apply_filter(&mut self) {
         let text = self.get_search_text();
-        self.filter = if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        };
-
-        for card in &self.cards {
-            unsafe {
-                let () = msg_send![&*card.view, removeFromSuperview];
-            }
-        }
-
-        let matching: Vec<usize> = (0..self.all_presets.len())
-            .filter(|&i| {
-                self.filter.as_ref().map_or(true, |f| {
-                    self.all_presets[i].to_lowercase().contains(&f.to_lowercase())
-                })
-            })
-            .collect();
-
-        let rows = (matching.len() + COLS - 1) / COLS;
-        let doc_h = PAD + rows as f64 * (CARD_H + PAD) + PAD;
-        let doc_w = COLS as f64 * (CARD_W + PAD) + PAD;
-        unsafe {
-            let () = msg_send![&*self.document_view, setFrame: CGRect::new(
-                CGPoint::new(0.0, 0.0),
-                CGSize::new(doc_w, doc_h),
-            )];
-        }
-
-        for (grid_pos, &preset_idx) in matching.iter().enumerate() {
-            let row = grid_pos / COLS;
-            let col = grid_pos % COLS;
-            let x = PAD + col as f64 * (CARD_W + PAD);
-            let y = doc_h - PAD - row as f64 * (CARD_H + PAD) - CARD_H;
-            let frame = CGRect::new(CGPoint::new(x, y), CGSize::new(CARD_W, CARD_H));
-            unsafe {
-                let () = msg_send![&*self.cards[preset_idx].view, setFrame: frame];
-                let () = msg_send![&*self.document_view, addSubview: &*self.cards[preset_idx].view];
-            }
-        }
-
-        self.visible_indices = matching;
+        self.filter = if text.is_empty() { None } else { Some(text) };
+        self.relayout();
+        self.scroll_to_top();
     }
 
     pub fn clear_filter(&mut self) {
@@ -674,7 +1089,7 @@ impl Gallery {
             let layer: *mut AnyObject = msg_send![&*card.view, layer];
             if active {
                 let border: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 0.2, green: 0.55, blue: 1.0, alpha: 1.0];
-                let cg: *mut AnyObject = msg_send![&*border, CGColor];
+                let cg: *mut CGColor = msg_send![&*border, CGColor];
                 let () = msg_send![layer, setBorderColor: cg];
                 let () = msg_send![layer, setBorderWidth: 3.0];
             } else {
@@ -690,7 +1105,8 @@ impl Gallery {
             let is_fav = favorites.contains(name);
             unsafe {
                 let star = if is_fav { "\u{2605}" } else { "\u{2606}" };
-                let () = msg_send![&*self.cards[i].fav_button, setTitle: &*NSString::from_str(star)];
+                let () =
+                    msg_send![&*self.cards[i].fav_button, setTitle: &*NSString::from_str(star)];
             }
         }
     }
@@ -709,6 +1125,9 @@ impl Gallery {
         unsafe {
             let star = if is_fav { "\u{2605}" } else { "\u{2606}" };
             let () = msg_send![&*self.cards[preset_index].fav_button, setTitle: &*NSString::from_str(star)];
+        }
+        if self.show_favorites_only {
+            self.relayout();
         }
     }
 }

@@ -5,10 +5,7 @@ fn main() {
         .expect("libprojectM pkgdatadir not found");
 
     let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .file("shim.cpp")
-        .flag("-std=c++17");
+    build.cpp(true).file("shim.cpp").flag("-std=c++17");
 
     for path in &projectm.include_paths {
         build.include(path);

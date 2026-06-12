@@ -78,7 +78,10 @@ impl Config {
     pub fn save(&self) {
         if let Some(dir) = Self::config_dir() {
             let _ = fs::create_dir_all(&dir);
-            let _ = fs::write(Self::config_path(), serde_json::to_string_pretty(self).unwrap_or_default());
+            let _ = fs::write(
+                Self::config_path(),
+                serde_json::to_string_pretty(self).unwrap_or_default(),
+            );
         }
     }
 

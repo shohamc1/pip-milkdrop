@@ -31,4 +31,5 @@ extern "C" {
 
     pub fn pm_get_preset_name(handle: pm_handle, index: u32) -> *const i8;
     pub fn pm_get_selected_preset_index(handle: pm_handle, out_index: *mut u32) -> bool;
+    pub fn pm_add_preset_url(handle: pm_handle, url: *const i8, name: *const i8) -> u32;
 }

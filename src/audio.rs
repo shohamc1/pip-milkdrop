@@ -23,7 +23,12 @@ extern "C" {
     fn AudioObjectAddPropertyListener(
         inObjectID: u32,
         inAddress: *const AudioObjectPropertyAddress,
-        inListener: unsafe extern "C" fn(u32, u32, *const AudioObjectPropertyAddress, *mut c_void) -> i32,
+        inListener: unsafe extern "C" fn(
+            u32,
+            u32,
+            *const AudioObjectPropertyAddress,
+            *mut c_void,
+        ) -> i32,
         inClientData: *mut c_void,
     ) -> i32;
 }
@@ -135,10 +140,8 @@ impl AudioCapture {
                         if data.is_empty() {
                             return;
                         }
-                        let converted: Vec<f32> = data
-                            .iter()
-                            .map(|&s| s as f32 / i16::MAX as f32)
-                            .collect();
+                        let converted: Vec<f32> =
+                            data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                         let _ = tx.send(converted);
                     },
                     |err| eprintln!("[pip-milkdrop] Audio error: {err}"),

@@ -10,11 +10,9 @@ pub fn is_media_playing() -> bool {
 
 pub fn start_polling() {
     let queue = dispatch2::DispatchQueue::new("com.pip-milkdrop.media", None);
-    std::thread::spawn(move || {
-        loop {
-            poll_once(&queue);
-            std::thread::sleep(Duration::from_secs(1));
-        }
+    std::thread::spawn(move || loop {
+        poll_once(&queue);
+        std::thread::sleep(Duration::from_secs(1));
     });
 }
 
