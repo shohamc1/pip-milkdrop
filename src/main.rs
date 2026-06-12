@@ -528,6 +528,11 @@ fn main() {
         }
 
         if let Some(ref mut g) = gallery {
+            if g.is_open() {
+                // Keep chrome/grid layout in sync during live resize even when the mouse
+                // is hovering a card and thumbnail preview rendering is paused.
+                g.sync_layout_to_bounds();
+            }
             if g.is_open() && !hover_active {
                 g.tick(&viz);
             }

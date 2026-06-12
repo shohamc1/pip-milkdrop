@@ -30,14 +30,18 @@ pub const GA_FAV_BASE: i32 = 5000;
 
 const PREVIEW_W: usize = 300;
 const PREVIEW_H: usize = 300;
-const CARD_W: f64 = 160.0;
-const CARD_H: f64 = 210.0;
-const IMG_SIZE: f64 = 150.0;
-const PAD: f64 = 8.0;
-const COLS: usize = 5;
+const CARD_W: f64 = 148.0;
+const CARD_H: f64 = 188.0;
+const IMG_SIZE: f64 = 132.0;
+const PAD: f64 = 6.0;
+const MIN_COLS: usize = 2;
 const WARMUP_INITIAL: usize = 8;
 const FRAMES_PER_TICK: usize = 2;
-const SECTION_HEADER_H: f64 = 28.0;
+const SECTION_HEADER_H: f64 = 24.0;
+const HEADER_PAD: f64 = 10.0;
+const SEARCH_H: f64 = 28.0;
+const TAB_H: f64 = 28.0;
+const HEADER_GAP: f64 = 6.0;
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -286,8 +290,11 @@ pub struct Gallery {
     window: Retained<NSWindow>,
     #[allow(dead_code)]
     scroll_view: Retained<AnyObject>,
+    content_view: Retained<NSView>,
     document_view: Retained<AnyObject>,
     search_field: Retained<AnyObject>,
+    search_btn: Retained<AnyObject>,
+    clear_btn: Retained<AnyObject>,
     #[allow(dead_code)]
     handler: Retained<GalleryHandler>,
     cards: Vec<Card>,
@@ -398,13 +405,12 @@ impl Gallery {
         let content_view = NSView::initWithFrame(NSView::alloc(mtm), content_rect);
         window.setContentView(Some(&content_view));
 
-        let search_h = 28.0;
-        let search_y = win_h - search_h - PAD;
+        let search_y = win_h - HEADER_PAD - SEARCH_H;
         let search_field: Retained<AnyObject> = unsafe {
             let tf: *mut AnyObject = msg_send![class!(NSSearchField), alloc];
             let tf: *mut AnyObject = msg_send![tf, initWithFrame: CGRect::new(
                 CGPoint::new(PAD, search_y),
-                CGSize::new(win_w - 200.0, search_h),
+                CGSize::new(win_w - 2.0 * HEADER_PAD - 150.0, SEARCH_H),
             )];
             let tf = Retained::from_raw(tf).unwrap();
             let () = msg_send![&*tf, setEditable: true];
@@ -414,7 +420,7 @@ impl Gallery {
             let () = msg_send![&*tf, setAction: search_sel];
             // Make Return in the search field apply the filter; the explicit button remains
             // for discoverability.
-            let () = msg_send![&*tf, setAutoresizingMask: 10usize];
+            let () = msg_send![&*tf, setAutoresizingMask: 0usize];
             tf
         };
         unsafe {
@@ -424,15 +430,15 @@ impl Gallery {
         let search_btn: Retained<AnyObject> = unsafe {
             let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(win_w - 180.0, search_y),
-                CGSize::new(80.0, search_h),
+                CGPoint::new(win_w - HEADER_PAD - 144.0, search_y),
+                CGSize::new(70.0, SEARCH_H),
             )];
             let btn = Retained::from_raw(btn).unwrap();
             let () = msg_send![&*btn, setTitle: &*NSString::from_str("Search")];
             let () = msg_send![&*btn, setTarget: handler_ref];
             let () = msg_send![&*btn, setAction: search_sel];
             let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 9usize];
+            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
             btn
         };
         unsafe {
@@ -442,35 +448,34 @@ impl Gallery {
         let clear_btn: Retained<AnyObject> = unsafe {
             let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(win_w - 90.0, search_y),
-                CGSize::new(80.0, search_h),
+                CGPoint::new(win_w - HEADER_PAD - 68.0, search_y),
+                CGSize::new(70.0, SEARCH_H),
             )];
             let btn = Retained::from_raw(btn).unwrap();
             let () = msg_send![&*btn, setTitle: &*NSString::from_str("Clear")];
             let () = msg_send![&*btn, setTarget: handler_ref];
             let () = msg_send![&*btn, setAction: clear_sel];
             let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 9usize];
+            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
             btn
         };
         unsafe {
             let () = msg_send![&*content_view, addSubview: &*clear_btn];
         }
 
-        let tab_h = 26.0;
-        let tab_y = search_y - tab_h - 4.0;
+        let tab_y = search_y - TAB_H - 4.0;
         let tab_all_btn: Retained<AnyObject> = unsafe {
             let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(PAD, tab_y),
-                CGSize::new(80.0, tab_h),
+                CGPoint::new(HEADER_PAD, tab_y),
+                CGSize::new(96.0, TAB_H),
             )];
             let btn = Retained::from_raw(btn).unwrap();
             let () = msg_send![&*btn, setTitle: &*NSString::from_str("All")];
             let () = msg_send![&*btn, setTarget: handler_ref];
             let () = msg_send![&*btn, setAction: tab_all_sel];
             let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 10usize];
+            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
             btn
         };
         unsafe {
@@ -480,30 +485,31 @@ impl Gallery {
         let tab_fav_btn: Retained<AnyObject> = unsafe {
             let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(PAD + 86.0, tab_y),
-                CGSize::new(100.0, tab_h),
+                CGPoint::new(HEADER_PAD + 100.0, tab_y),
+                CGSize::new(116.0, TAB_H),
             )];
             let btn = Retained::from_raw(btn).unwrap();
             let () = msg_send![&*btn, setTitle: &*NSString::from_str("Favorites")];
             let () = msg_send![&*btn, setTarget: handler_ref];
             let () = msg_send![&*btn, setAction: tab_fav_sel];
             let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 10usize];
+            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
             btn
         };
         unsafe {
             let () = msg_send![&*content_view, addSubview: &*tab_fav_btn];
         }
 
-        let grid_h = tab_y - PAD;
+        let grid_h = (tab_y - HEADER_GAP).max(120.0);
         let scroll_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(win_w, grid_h));
         let scroll_view: Retained<AnyObject> = unsafe {
             let sv: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
             let sv: *mut AnyObject = msg_send![sv, initWithFrame: scroll_rect];
             let sv = Retained::from_raw(sv).unwrap();
             let () = msg_send![&*sv, setHasVerticalScroller: true];
-            let () = msg_send![&*sv, setAutohidesScrollers: true];
-            let () = msg_send![&*sv, setAutoresizingMask: 18usize];
+            let () = msg_send![&*sv, setAutohidesScrollers: false];
+            let () = msg_send![&*sv, setScrollerStyle: 0isize]; // NSScrollerStyleLegacy: always visible, avoids hidden overlay affordance.
+            let () = msg_send![&*sv, setAutoresizingMask: 0usize];
             sv
         };
         unsafe {
@@ -547,7 +553,7 @@ impl Gallery {
             }
 
             let img_rect = CGRect::new(
-                CGPoint::new((CARD_W - IMG_SIZE) / 2.0, 40.0),
+                CGPoint::new((CARD_W - IMG_SIZE) / 2.0, 34.0),
                 CGSize::new(IMG_SIZE, IMG_SIZE),
             );
             let image_view: Retained<AnyObject> = unsafe {
@@ -562,7 +568,7 @@ impl Gallery {
                 let () = msg_send![&*card_view, addSubview: &*image_view];
             }
 
-            let label_rect = CGRect::new(CGPoint::new(4.0, 4.0), CGSize::new(CARD_W - 8.0, 28.0));
+            let label_rect = CGRect::new(CGPoint::new(6.0, 4.0), CGSize::new(CARD_W - 12.0, 24.0));
             let name_label: Retained<AnyObject> = unsafe {
                 let tf: *mut AnyObject = msg_send![class!(NSTextField), alloc];
                 let tf: *mut AnyObject = msg_send![tf, initWithFrame: label_rect];
@@ -587,7 +593,7 @@ impl Gallery {
             }
 
             let fav_rect = CGRect::new(
-                CGPoint::new(CARD_W - 26.0, IMG_SIZE + 40.0 - 24.0),
+                CGPoint::new(CARD_W - 28.0, IMG_SIZE + 34.0 - 26.0),
                 CGSize::new(24.0, 24.0),
             );
             let is_fav = favorites.contains(name);
@@ -616,7 +622,7 @@ impl Gallery {
             });
         }
 
-        let doc_w = COLS as f64 * (CARD_W + PAD) + PAD;
+        let doc_w = 5.0 * (CARD_W + PAD) + PAD;
         let doc_h = 1.0f64;
         let doc_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(doc_w, doc_h));
         let document_view: Retained<AnyObject> = unsafe {
@@ -654,8 +660,11 @@ impl Gallery {
         let mut gallery = Self {
             window,
             scroll_view,
+            content_view,
             document_view,
             search_field,
+            search_btn,
+            clear_btn,
             handler,
             cards,
             preview_images,
@@ -683,6 +692,7 @@ impl Gallery {
             last_layout_h: 0.0,
         };
 
+        gallery.layout_chrome();
         gallery.relayout();
 
         let mut initial_queue = Vec::new();
@@ -699,6 +709,50 @@ impl Gallery {
         gallery.update_active(active_index);
         gallery.update_tab_style();
         gallery
+    }
+
+    fn layout_chrome(&self) {
+        let bounds: CGRect = unsafe { msg_send![&*self.content_view, bounds] };
+        let w = bounds.size.width.max(400.0);
+        let h = bounds.size.height.max(300.0);
+
+        let button_gap = 6.0;
+        let search_button_w = 70.0;
+        let clear_button_w = 62.0;
+        let search_y = h - HEADER_PAD - SEARCH_H;
+        let clear_x = w - HEADER_PAD - clear_button_w;
+        let search_btn_x = clear_x - button_gap - search_button_w;
+        let search_w = (search_btn_x - HEADER_PAD - button_gap).max(120.0);
+
+        let tab_y = search_y - HEADER_GAP - TAB_H;
+        let scroll_h = (tab_y - HEADER_GAP).max(80.0);
+
+        unsafe {
+            let () = msg_send![&*self.search_field, setFrame: CGRect::new(
+                CGPoint::new(HEADER_PAD, search_y),
+                CGSize::new(search_w, SEARCH_H),
+            )];
+            let () = msg_send![&*self.search_btn, setFrame: CGRect::new(
+                CGPoint::new(search_btn_x, search_y),
+                CGSize::new(search_button_w, SEARCH_H),
+            )];
+            let () = msg_send![&*self.clear_btn, setFrame: CGRect::new(
+                CGPoint::new(clear_x, search_y),
+                CGSize::new(clear_button_w, SEARCH_H),
+            )];
+            let () = msg_send![&*self.tab_all_btn, setFrame: CGRect::new(
+                CGPoint::new(HEADER_PAD, tab_y),
+                CGSize::new(96.0, TAB_H),
+            )];
+            let () = msg_send![&*self.tab_fav_btn, setFrame: CGRect::new(
+                CGPoint::new(HEADER_PAD + 100.0, tab_y),
+                CGSize::new(116.0, TAB_H),
+            )];
+            let () = msg_send![&*self.scroll_view, setFrame: CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(w, scroll_h),
+            )];
+        }
     }
 
     fn relayout(&mut self) {
@@ -729,9 +783,14 @@ impl Gallery {
         let viewport_w = viewport_bounds.size.width.max(CARD_W + PAD * 2.0);
         let cols = ((viewport_w - PAD) / (CARD_W + PAD))
             .floor()
-            .max(1.0)
-            .min(COLS as f64) as usize;
-        let grid_w = cols as f64 * (CARD_W + PAD) + PAD;
+            .max(MIN_COLS as f64) as usize;
+        let used_w = cols as f64 * CARD_W;
+        let gap = if cols > 1 {
+            ((viewport_w - used_w) / (cols as f64 + 1.0)).clamp(PAD, 18.0)
+        } else {
+            PAD
+        };
+        let grid_w = cols as f64 * CARD_W + (cols as f64 + 1.0) * gap;
         let doc_w = viewport_w.max(grid_w);
 
         let sections = self.sections();
@@ -851,7 +910,7 @@ impl Gallery {
                 for (gi, &preset_idx) in indices.iter().enumerate() {
                     let row = gi / cols;
                     let col = gi % cols;
-                    let x = PAD + col as f64 * (CARD_W + PAD);
+                    let x = gap + col as f64 * (CARD_W + gap);
                     let y = doc_h - y_from_top - row as f64 * (CARD_H + PAD) - CARD_H;
                     let frame = CGRect::new(CGPoint::new(x, y), CGSize::new(CARD_W, CARD_H));
                     unsafe {
@@ -880,6 +939,7 @@ impl Gallery {
     }
 
     pub fn sync_layout_to_bounds(&mut self) {
+        self.layout_chrome();
         let bounds: CGRect = unsafe { msg_send![&*self.scroll_view, frame] };
         if (bounds.size.width - self.last_layout_w).abs() > 0.5
             || (bounds.size.height - self.last_layout_h).abs() > 0.5
