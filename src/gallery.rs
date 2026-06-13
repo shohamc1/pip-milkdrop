@@ -21,7 +21,6 @@ pub static GALLERY_ACTION: AtomicI32 = AtomicI32::new(0);
 pub static GALLERY_HOVER: AtomicI32 = AtomicI32::new(-1);
 
 pub const GA_SEARCH: i32 = 1;
-pub const GA_CLEAR: i32 = 2;
 pub const GA_TAB_ALL: i32 = 3;
 pub const GA_TAB_FAV: i32 = 4;
 pub const GA_SECTION_BASE: i32 = 100;
@@ -30,18 +29,20 @@ pub const GA_FAV_BASE: i32 = 5000;
 
 const PREVIEW_W: usize = 300;
 const PREVIEW_H: usize = 300;
-const CARD_W: f64 = 148.0;
-const CARD_H: f64 = 188.0;
-const IMG_SIZE: f64 = 132.0;
-const PAD: f64 = 6.0;
+const CARD_W: f64 = 168.0;
+const CARD_H: f64 = 168.0;
+const OVERLAY_H: f64 = 62.0;
+const PAD: f64 = 0.0;
+const LABEL_PAD: f64 = 9.0;
 const MIN_COLS: usize = 2;
 const WARMUP_INITIAL: usize = 8;
 const FRAMES_PER_TICK: usize = 2;
-const SECTION_HEADER_H: f64 = 24.0;
-const HEADER_PAD: f64 = 10.0;
+const SECTION_HEADER_H: f64 = 28.0;
+const HEADER_PAD: f64 = 12.0;
 const SEARCH_H: f64 = 28.0;
-const TAB_H: f64 = 28.0;
-const HEADER_GAP: f64 = 6.0;
+const TAB_W: f64 = 184.0;
+const SEARCH_W: f64 = 240.0;
+const HEADER_GAP: f64 = 12.0;
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -60,19 +61,14 @@ define_class!(
             GALLERY_ACTION.store(GA_SEARCH, Ordering::Relaxed);
         }
 
-        #[unsafe(method(clearClicked:))]
-        fn clear_clicked(&self, _sender: Option<&AnyObject>) {
-            GALLERY_ACTION.store(GA_CLEAR, Ordering::Relaxed);
-        }
-
-        #[unsafe(method(tabAllClicked:))]
-        fn tab_all_clicked(&self, _sender: Option<&AnyObject>) {
-            GALLERY_ACTION.store(GA_TAB_ALL, Ordering::Relaxed);
-        }
-
-        #[unsafe(method(tabFavClicked:))]
-        fn tab_fav_clicked(&self, _sender: Option<&AnyObject>) {
-            GALLERY_ACTION.store(GA_TAB_FAV, Ordering::Relaxed);
+        #[unsafe(method(tabChanged:))]
+        fn tab_changed(&self, sender: Option<&AnyObject>) {
+            let Some(sender) = sender else { return };
+            let selected: isize = unsafe { msg_send![sender, selectedSegment] };
+            GALLERY_ACTION.store(
+                if selected == 1 { GA_TAB_FAV } else { GA_TAB_ALL },
+                Ordering::Relaxed,
+            );
         }
     }
 );
@@ -224,6 +220,16 @@ fn capture_gl_image() -> Option<Retained<AnyObject>> {
     unsafe { create_nsimage_from_pixels(&flipped, read_w, read_h) }
 }
 
+fn fav_tint(is_fav: bool) -> Retained<AnyObject> {
+    unsafe {
+        if is_fav {
+            msg_send![class!(NSColor), colorWithCalibratedRed: 1.0, green: 0.82, blue: 0.25, alpha: 1.0]
+        } else {
+            msg_send![class!(NSColor), colorWithCalibratedRed: 1.0, green: 1.0, blue: 1.0, alpha: 0.9]
+        }
+    }
+}
+
 fn thumbnail_path(dir: &PathBuf, name: &str) -> PathBuf {
     let safe = name.replace('/', "_").replace('\\', "_").replace(':', "_");
     dir.join(format!("{safe}.rgba"))
@@ -274,9 +280,11 @@ fn load_thumbnail(dir: &PathBuf, name: &str) -> Option<Retained<AnyObject>> {
 struct Card {
     view: Retained<CardView>,
     image_view: Retained<AnyObject>,
+    overlay: Retained<AnyObject>,
     #[allow(dead_code)]
     name_label: Retained<AnyObject>,
     fav_button: Retained<AnyObject>,
+    is_favorite: bool,
 }
 
 struct SectionInfo {
@@ -297,8 +305,6 @@ pub struct Gallery {
     content_view: Retained<NSView>,
     document_view: Retained<AnyObject>,
     search_field: Retained<AnyObject>,
-    search_btn: Retained<AnyObject>,
-    clear_btn: Retained<AnyObject>,
     #[allow(dead_code)]
     handler: Retained<GalleryHandler>,
     cards: Vec<Card>,
@@ -314,8 +320,8 @@ pub struct Gallery {
     section_labels: Vec<Retained<AnyObject>>,
     collapsed_sections: HashSet<usize>,
     show_favorites_only: bool,
-    tab_all_btn: Retained<AnyObject>,
-    tab_fav_btn: Retained<AnyObject>,
+    tab_control: Retained<AnyObject>,
+    hovered: Option<usize>,
     thumbnail_dir: PathBuf,
 
     sim_time: f64,
@@ -368,9 +374,7 @@ impl Gallery {
         let handler_ref: &AnyObject = handler.as_ref();
         let fav_sel = sel!(favClicked:);
         let search_sel = sel!(searchClicked:);
-        let clear_sel = sel!(clearClicked:);
-        let tab_all_sel = sel!(tabAllClicked:);
-        let tab_fav_sel = sel!(tabFavClicked:);
+        let tab_sel = sel!(tabChanged:);
 
         let thumbnail_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -414,8 +418,8 @@ impl Gallery {
         let search_field: Retained<AnyObject> = unsafe {
             let tf: *mut AnyObject = msg_send![class!(NSSearchField), alloc];
             let tf: *mut AnyObject = msg_send![tf, initWithFrame: CGRect::new(
-                CGPoint::new(PAD, search_y),
-                CGSize::new(win_w - 2.0 * HEADER_PAD - 150.0, SEARCH_H),
+                CGPoint::new(win_w - HEADER_PAD - SEARCH_W, search_y),
+                CGSize::new(SEARCH_W, SEARCH_H),
             )];
             let tf = Retained::from_raw(tf).unwrap();
             let () = msg_send![&*tf, setEditable: true];
@@ -423,8 +427,10 @@ impl Gallery {
                 msg_send![&*tf, setPlaceholderString: &*NSString::from_str("Filter presets...")];
             let () = msg_send![&*tf, setTarget: handler_ref];
             let () = msg_send![&*tf, setAction: search_sel];
-            // Make Return in the search field apply the filter; the explicit button remains
-            // for discoverability.
+            // Filter live as the user types (and on the built-in clear button) rather than
+            // requiring a separate Search button.
+            let () = msg_send![&*tf, setSendsSearchStringImmediately: false];
+            let () = msg_send![&*tf, setSendsWholeSearchString: false];
             let () = msg_send![&*tf, setAutoresizingMask: 0usize];
             tf
         };
@@ -432,80 +438,31 @@ impl Gallery {
             let () = msg_send![&*content_view, addSubview: &*search_field];
         }
 
-        let search_btn: Retained<AnyObject> = unsafe {
-            let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(win_w - HEADER_PAD - 144.0, search_y),
-                CGSize::new(70.0, SEARCH_H),
+        let tab_control: Retained<AnyObject> = unsafe {
+            let sc: *mut AnyObject = msg_send![class!(NSSegmentedControl), alloc];
+            let sc: *mut AnyObject = msg_send![sc, initWithFrame: CGRect::new(
+                CGPoint::new(HEADER_PAD, search_y),
+                CGSize::new(TAB_W, SEARCH_H),
             )];
-            let btn = Retained::from_raw(btn).unwrap();
-            let () = msg_send![&*btn, setTitle: &*NSString::from_str("Search")];
-            let () = msg_send![&*btn, setTarget: handler_ref];
-            let () = msg_send![&*btn, setAction: search_sel];
-            let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
-            btn
+            let sc = Retained::from_raw(sc).unwrap();
+            let () = msg_send![&*sc, setSegmentCount: 2isize];
+            let () = msg_send![&*sc, setSegmentStyle: 1isize]; // NSSegmentStyleRounded
+            let () = msg_send![&*sc, setLabel: &*NSString::from_str("All") forSegment: 0isize];
+            let () =
+                msg_send![&*sc, setLabel: &*NSString::from_str("Favorites") forSegment: 1isize];
+            let () = msg_send![&*sc, setWidth: TAB_W / 2.0 forSegment: 0isize];
+            let () = msg_send![&*sc, setWidth: TAB_W / 2.0 forSegment: 1isize];
+            let () = msg_send![&*sc, setSelectedSegment: 0isize];
+            let () = msg_send![&*sc, setTarget: handler_ref];
+            let () = msg_send![&*sc, setAction: tab_sel];
+            let () = msg_send![&*sc, setAutoresizingMask: 0usize];
+            sc
         };
         unsafe {
-            let () = msg_send![&*content_view, addSubview: &*search_btn];
+            let () = msg_send![&*content_view, addSubview: &*tab_control];
         }
 
-        let clear_btn: Retained<AnyObject> = unsafe {
-            let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(win_w - HEADER_PAD - 68.0, search_y),
-                CGSize::new(70.0, SEARCH_H),
-            )];
-            let btn = Retained::from_raw(btn).unwrap();
-            let () = msg_send![&*btn, setTitle: &*NSString::from_str("Clear")];
-            let () = msg_send![&*btn, setTarget: handler_ref];
-            let () = msg_send![&*btn, setAction: clear_sel];
-            let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
-            btn
-        };
-        unsafe {
-            let () = msg_send![&*content_view, addSubview: &*clear_btn];
-        }
-
-        let tab_y = search_y - TAB_H - 4.0;
-        let tab_all_btn: Retained<AnyObject> = unsafe {
-            let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(HEADER_PAD, tab_y),
-                CGSize::new(96.0, TAB_H),
-            )];
-            let btn = Retained::from_raw(btn).unwrap();
-            let () = msg_send![&*btn, setTitle: &*NSString::from_str("All")];
-            let () = msg_send![&*btn, setTarget: handler_ref];
-            let () = msg_send![&*btn, setAction: tab_all_sel];
-            let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
-            btn
-        };
-        unsafe {
-            let () = msg_send![&*content_view, addSubview: &*tab_all_btn];
-        }
-
-        let tab_fav_btn: Retained<AnyObject> = unsafe {
-            let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let btn: *mut AnyObject = msg_send![btn, initWithFrame: CGRect::new(
-                CGPoint::new(HEADER_PAD + 100.0, tab_y),
-                CGSize::new(116.0, TAB_H),
-            )];
-            let btn = Retained::from_raw(btn).unwrap();
-            let () = msg_send![&*btn, setTitle: &*NSString::from_str("Favorites")];
-            let () = msg_send![&*btn, setTarget: handler_ref];
-            let () = msg_send![&*btn, setAction: tab_fav_sel];
-            let () = msg_send![&*btn, setBezelStyle: 1isize];
-            let () = msg_send![&*btn, setAutoresizingMask: 0usize];
-            btn
-        };
-        unsafe {
-            let () = msg_send![&*content_view, addSubview: &*tab_fav_btn];
-        }
-
-        let grid_h = (tab_y - HEADER_GAP).max(120.0);
+        let grid_h = (search_y - HEADER_GAP).max(120.0);
         let scroll_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(win_w, grid_h));
         let scroll_view: Retained<AnyObject> = unsafe {
             let sv: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
@@ -522,10 +479,10 @@ impl Gallery {
         }
 
         let total = presets.len();
-        let small_font: Retained<AnyObject> =
-            unsafe { msg_send![class!(NSFont), systemFontOfSize: 11.0] };
+        let name_font: Retained<AnyObject> =
+            unsafe { msg_send![class!(NSFont), systemFontOfSize: 12.0 weight: 0.3f64] };
         let star_font: Retained<AnyObject> =
-            unsafe { msg_send![class!(NSFont), systemFontOfSize: 16.0] };
+            unsafe { msg_send![class!(NSFont), systemFontOfSize: 18.0] };
         let white_color: *mut AnyObject = unsafe { msg_send![class!(NSColor), whiteColor] };
 
         let mut cards = Vec::with_capacity(total);
@@ -538,17 +495,18 @@ impl Gallery {
             unsafe {
                 let () = msg_send![&*card_view, setWantsLayer: true];
                 let layer: *mut AnyObject = msg_send![&*card_view, layer];
-                let () = msg_send![layer, setCornerRadius: 6.0];
                 let () = msg_send![layer, setMasksToBounds: true];
-                let bg: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 0.12, green: 0.12, blue: 0.14, alpha: 1.0];
+                let bg: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 0.07, green: 0.07, blue: 0.09, alpha: 1.0];
                 let cg: *mut CGColor = msg_send![&*bg, CGColor];
                 let () = msg_send![layer, setBackgroundColor: cg];
 
                 let bounds: CGRect = msg_send![&*card_view, bounds];
+                // MouseEnteredAndExited | ActiveAlways | InVisibleRect. InVisibleRect makes
+                // the tracking area follow the card as it is resized during relayout.
                 let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
                 let tracking: *mut AnyObject = msg_send![tracking,
                     initWithRect: bounds
-                    options: 129usize
+                    options: 641usize
                     owner: &*card_view
                     userInfo: std::ptr::null_mut::<AnyObject>()
                 ];
@@ -557,49 +515,95 @@ impl Gallery {
                 }
             }
 
-            let img_rect = CGRect::new(
-                CGPoint::new((CARD_W - IMG_SIZE) / 2.0, 34.0),
-                CGSize::new(IMG_SIZE, IMG_SIZE),
-            );
+            // Full-bleed thumbnail filling the whole card; thumbnails are square so a
+            // fill scale crops nothing.
             let image_view: Retained<AnyObject> = unsafe {
                 let iv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-                let iv: *mut AnyObject = msg_send![iv, initWithFrame: img_rect];
+                let iv: *mut AnyObject = msg_send![iv, initWithFrame: card_rect];
                 let iv = Retained::from_raw(iv).unwrap();
-                let () = msg_send![&*iv, setImageScaling: 1isize];
+                let () = msg_send![&*iv, setImageScaling: 1isize]; // NSImageScaleAxesIndependently
                 let () = msg_send![&*iv, setEditable: false];
+                let () = msg_send![&*iv, setAutoresizingMask: 18usize];
                 iv
             };
             unsafe {
                 let () = msg_send![&*card_view, addSubview: &*image_view];
             }
 
-            let label_rect = CGRect::new(CGPoint::new(6.0, 4.0), CGSize::new(CARD_W - 12.0, 24.0));
+            let clean = name.strip_suffix(".milk").unwrap_or(name);
+            let display_name = clean.to_string();
+
+            // Bottom gradient + name overlay, revealed on hover only.
+            let overlay_rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(CARD_W, OVERLAY_H));
+            let overlay: Retained<AnyObject> = unsafe {
+                let ov: *mut AnyObject = msg_send![class!(NSView), alloc];
+                let ov: *mut AnyObject = msg_send![ov, initWithFrame: overlay_rect];
+                let ov = Retained::from_raw(ov).unwrap();
+                let () = msg_send![&*ov, setWantsLayer: true];
+                let () = msg_send![&*ov, setHidden: true];
+                let () = msg_send![&*ov, setAutoresizingMask: 2usize]; // width-resizable
+
+                let grad: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
+                let () = msg_send![grad, setFrame: overlay_rect];
+                let c0: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 0.0, green: 0.0, blue: 0.0, alpha: 0.92];
+                let c0: *mut CGColor = msg_send![&*c0, CGColor];
+                let c1: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 0.0, green: 0.0, blue: 0.0, alpha: 0.0];
+                let c1: *mut CGColor = msg_send![&*c1, CGColor];
+                // CAGradientLayer.colors is an array of CGColorRef, but it is typed `id` —
+                // pass them as object pointers so the objc2 type check accepts the array.
+                let items: [*mut AnyObject; 2] = [c0 as *mut AnyObject, c1 as *mut AnyObject];
+                let colors: *mut AnyObject =
+                    msg_send![class!(NSArray), arrayWithObjects: items.as_ptr(), count: 2usize];
+                let () = msg_send![grad, setColors: colors];
+                let ov_layer: *mut AnyObject = msg_send![&*ov, layer];
+                let () = msg_send![ov_layer, addSublayer: grad];
+                ov
+            };
+
+            let label_w = CARD_W - 2.0 * LABEL_PAD;
             let name_label: Retained<AnyObject> = unsafe {
                 let tf: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-                let tf: *mut AnyObject = msg_send![tf, initWithFrame: label_rect];
+                let tf: *mut AnyObject = msg_send![tf, initWithFrame: CGRect::new(
+                    CGPoint::new(LABEL_PAD, LABEL_PAD),
+                    CGSize::new(label_w, 16.0),
+                )];
                 let tf = Retained::from_raw(tf).unwrap();
                 let () = msg_send![&*tf, setEditable: false];
                 let () = msg_send![&*tf, setSelectable: false];
                 let () = msg_send![&*tf, setBezeled: false];
                 let () = msg_send![&*tf, setDrawsBackground: false];
-                let () = msg_send![&*tf, setFont: &*small_font];
+                let () = msg_send![&*tf, setFont: &*name_font];
                 let () = msg_send![&*tf, setTextColor: white_color];
                 let () = msg_send![&*tf, setAlignment: 0isize];
                 let () = msg_send![&*tf, setUsesSingleLineMode: false];
+                let () = msg_send![&*tf, setMaximumNumberOfLines: 2isize];
                 let () = msg_send![&*tf, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-                let clean = name.strip_suffix(".milk").unwrap_or(name);
-                let display_name = clean.to_string();
+                                                                    // Setting a truncating line-break mode clears `wraps`; re-enable it (and
+                                                                    // disable scrolling) afterwards so the text wraps onto two lines first.
+                let cell: *mut AnyObject = msg_send![&*tf, cell];
+                let () = msg_send![cell, setScrollable: false];
+                let () = msg_send![cell, setWraps: true];
                 let () = msg_send![&*tf, setStringValue: &*NSString::from_str(&display_name)];
-                let () = msg_send![&*tf, setToolTip: &*NSString::from_str(&display_name)];
+                // Size the frame to the wrapped text (1 or 2 lines) and pin its bottom to a
+                // fixed inset, so every card has identical bottom padding regardless of
+                // line count.
+                let probe = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(label_w, 1000.0));
+                let needed: CGSize = msg_send![cell, cellSizeForBounds: probe];
+                let label_h = needed.height.ceil().min(OVERLAY_H - LABEL_PAD - 2.0);
+                let () = msg_send![&*tf, setFrame: CGRect::new(
+                    CGPoint::new(LABEL_PAD, LABEL_PAD),
+                    CGSize::new(label_w, label_h),
+                )];
                 tf
             };
             unsafe {
-                let () = msg_send![&*card_view, addSubview: &*name_label];
+                let () = msg_send![&*overlay, addSubview: &*name_label];
+                let () = msg_send![&*card_view, addSubview: &*overlay];
             }
 
             let fav_rect = CGRect::new(
-                CGPoint::new(CARD_W - 28.0, IMG_SIZE + 34.0 - 26.0),
-                CGSize::new(24.0, 24.0),
+                CGPoint::new(CARD_W - 32.0, CARD_H - 32.0),
+                CGSize::new(26.0, 26.0),
             );
             let is_fav = favorites.contains(name);
             let fav_button: Retained<AnyObject> = unsafe {
@@ -610,9 +614,13 @@ impl Gallery {
                 let () = msg_send![&*btn, setButtonType: 5isize];
                 let () = msg_send![&*btn, setTitle: &*NSString::from_str(if is_fav { "\u{2605}" } else { "\u{2606}" })];
                 let () = msg_send![&*btn, setFont: &*star_font];
+                let () = msg_send![&*btn, setContentTintColor: &*fav_tint(is_fav)];
                 let () = msg_send![&*btn, setTag: i as isize];
                 let () = msg_send![&*btn, setTarget: handler_ref];
                 let () = msg_send![&*btn, setAction: fav_sel];
+                // Favorites stay visible so they read at a glance; others appear on hover.
+                let () = msg_send![&*btn, setHidden: !is_fav];
+                let () = msg_send![&*btn, setAutoresizingMask: 9usize]; // pin to top-right
                 btn
             };
             unsafe {
@@ -622,8 +630,10 @@ impl Gallery {
             cards.push(Card {
                 view: card_view,
                 image_view,
+                overlay,
                 name_label,
                 fav_button,
+                is_favorite: is_fav,
             });
         }
 
@@ -668,8 +678,6 @@ impl Gallery {
             content_view,
             document_view,
             search_field,
-            search_btn,
-            clear_btn,
             handler,
             cards,
             preview_images,
@@ -684,8 +692,8 @@ impl Gallery {
             section_labels: Vec::new(),
             collapsed_sections,
             show_favorites_only: false,
-            tab_all_btn,
-            tab_fav_btn,
+            tab_control,
+            hovered: None,
             thumbnail_dir,
             sim_time: 0.0,
             current_preview: None,
@@ -722,37 +730,22 @@ impl Gallery {
         let w = bounds.size.width.max(400.0);
         let h = bounds.size.height.max(300.0);
 
-        let button_gap = 6.0;
-        let search_button_w = 70.0;
-        let clear_button_w = 62.0;
         let search_y = h - HEADER_PAD - SEARCH_H;
-        let clear_x = w - HEADER_PAD - clear_button_w;
-        let search_btn_x = clear_x - button_gap - search_button_w;
-        let search_w = (search_btn_x - HEADER_PAD - button_gap).max(120.0);
+        // The search field can shrink on narrow windows so it never collides with the tabs.
+        let max_search_w = (w - HEADER_PAD * 2.0 - TAB_W - HEADER_GAP).max(120.0);
+        let search_w = SEARCH_W.min(max_search_w);
+        let search_x = w - HEADER_PAD - search_w;
 
-        let tab_y = search_y - HEADER_GAP - TAB_H;
-        let scroll_h = (tab_y - HEADER_GAP).max(80.0);
+        let scroll_h = (search_y - HEADER_GAP).max(80.0);
 
         unsafe {
-            let () = msg_send![&*self.search_field, setFrame: CGRect::new(
+            let () = msg_send![&*self.tab_control, setFrame: CGRect::new(
                 CGPoint::new(HEADER_PAD, search_y),
+                CGSize::new(TAB_W, SEARCH_H),
+            )];
+            let () = msg_send![&*self.search_field, setFrame: CGRect::new(
+                CGPoint::new(search_x, search_y),
                 CGSize::new(search_w, SEARCH_H),
-            )];
-            let () = msg_send![&*self.search_btn, setFrame: CGRect::new(
-                CGPoint::new(search_btn_x, search_y),
-                CGSize::new(search_button_w, SEARCH_H),
-            )];
-            let () = msg_send![&*self.clear_btn, setFrame: CGRect::new(
-                CGPoint::new(clear_x, search_y),
-                CGSize::new(clear_button_w, SEARCH_H),
-            )];
-            let () = msg_send![&*self.tab_all_btn, setFrame: CGRect::new(
-                CGPoint::new(HEADER_PAD, tab_y),
-                CGSize::new(96.0, TAB_H),
-            )];
-            let () = msg_send![&*self.tab_fav_btn, setFrame: CGRect::new(
-                CGPoint::new(HEADER_PAD + 100.0, tab_y),
-                CGSize::new(116.0, TAB_H),
             )];
             let () = msg_send![&*self.scroll_view, setFrame: CGRect::new(
                 CGPoint::new(0.0, 0.0),
@@ -786,18 +779,13 @@ impl Gallery {
         let white_color: *mut AnyObject = unsafe { msg_send![class!(NSColor), whiteColor] };
 
         let viewport_bounds: CGRect = unsafe { msg_send![&*self.scroll_view, frame] };
-        let viewport_w = viewport_bounds.size.width.max(CARD_W + PAD * 2.0);
-        let cols = ((viewport_w - PAD) / (CARD_W + PAD))
-            .floor()
-            .max(MIN_COLS as f64) as usize;
-        let used_w = cols as f64 * CARD_W;
-        let gap = if cols > 1 {
-            ((viewport_w - used_w) / (cols as f64 + 1.0)).clamp(PAD, 18.0)
-        } else {
-            PAD
-        };
-        let grid_w = cols as f64 * CARD_W + (cols as f64 + 1.0) * gap;
-        let doc_w = viewport_w.max(grid_w);
+        let viewport_w = viewport_bounds.size.width.max(CARD_W);
+        // Cards fill the full width with no gaps: pick the column count nearest the ideal
+        // card width, then stretch each (square) cell to divide the width exactly.
+        let cols = (viewport_w / CARD_W).round().max(MIN_COLS as f64) as usize;
+        let cell_w = viewport_w / cols as f64;
+        let cell_h = cell_w;
+        let doc_w = viewport_w;
 
         let sections = self.sections();
         let filter_lc = self.filter.as_ref().map(|f| f.to_lowercase());
@@ -830,7 +818,7 @@ impl Gallery {
             doc_h += SECTION_HEADER_H;
             if !collapsed {
                 let rows = (indices.len() + cols - 1) / cols;
-                doc_h += rows as f64 * (CARD_H + PAD) + PAD;
+                doc_h += rows as f64 * cell_h;
             } else {
                 doc_h += PAD;
             }
@@ -916,9 +904,9 @@ impl Gallery {
                 for (gi, &preset_idx) in indices.iter().enumerate() {
                     let row = gi / cols;
                     let col = gi % cols;
-                    let x = gap + col as f64 * (CARD_W + gap);
-                    let y = doc_h - y_from_top - row as f64 * (CARD_H + PAD) - CARD_H;
-                    let frame = CGRect::new(CGPoint::new(x, y), CGSize::new(CARD_W, CARD_H));
+                    let x = col as f64 * cell_w;
+                    let y = doc_h - y_from_top - row as f64 * cell_h - cell_h;
+                    let frame = CGRect::new(CGPoint::new(x, y), CGSize::new(cell_w, cell_h));
                     unsafe {
                         let () = msg_send![&*self.cards[preset_idx].view, setFrame: frame];
                         let () = msg_send![&*self.document_view, addSubview: &*self.cards[preset_idx].view];
@@ -926,7 +914,7 @@ impl Gallery {
                     displayed.push(preset_idx);
                 }
                 let rows = (indices.len() + cols - 1) / cols;
-                y_from_top += rows as f64 * (CARD_H + PAD) + PAD;
+                y_from_top += rows as f64 * cell_h;
             } else {
                 y_from_top += PAD;
             }
@@ -1032,21 +1020,9 @@ impl Gallery {
     }
 
     fn update_tab_style(&self) {
-        let accent: *mut AnyObject = unsafe { msg_send![class!(NSColor), controlColor] };
-        let highlight: *mut AnyObject = unsafe { msg_send![class!(NSColor), selectedControlColor] };
+        let selected: isize = if self.show_favorites_only { 1 } else { 0 };
         unsafe {
-            let active = if self.show_favorites_only {
-                &self.tab_fav_btn
-            } else {
-                &self.tab_all_btn
-            };
-            let inactive = if self.show_favorites_only {
-                &self.tab_all_btn
-            } else {
-                &self.tab_fav_btn
-            };
-            let () = msg_send![&**active, setBezelColor: highlight];
-            let () = msg_send![&**inactive, setBezelColor: accent];
+            let () = msg_send![&*self.tab_control, setSelectedSegment: selected];
         }
     }
 
@@ -1198,22 +1174,70 @@ impl Gallery {
     pub fn update_active(&mut self, index: usize) {
         let old = self.active_index;
         self.active_index = index;
-        self.set_card_highlight(old, false);
-        self.set_card_highlight(index, true);
+        self.update_card_border(old);
+        self.update_card_border(index);
     }
 
-    fn set_card_highlight(&self, index: usize, active: bool) {
+    /// Reveal the name overlay + star and a hover border on the card under the cursor,
+    /// restoring the cached thumbnail on the card the cursor just left. Called from the
+    /// main loop, matching the "callbacks set atomics, main loop acts" convention.
+    pub fn update_hover(&mut self, hover: i32) {
+        let new = if hover >= 0 {
+            Some(hover as usize)
+        } else {
+            None
+        };
+        if new == self.hovered {
+            return;
+        }
+        let old = self.hovered;
+        self.hovered = new;
+
+        if let Some(old) = old {
+            if old < self.cards.len() {
+                let was_fav = self.cards[old].is_favorite;
+                unsafe {
+                    let () = msg_send![&*self.cards[old].overlay, setHidden: true];
+                    let () = msg_send![&*self.cards[old].fav_button, setHidden: !was_fav];
+                }
+                // The live hover frames replaced the static thumbnail; put it back.
+                if let Some(Some(img)) = self.preview_images.get(old) {
+                    unsafe {
+                        let () = msg_send![&*self.cards[old].image_view, setImage: &**img];
+                    }
+                }
+                self.update_card_border(old);
+            }
+        }
+        if let Some(idx) = new {
+            if idx < self.cards.len() {
+                unsafe {
+                    let () = msg_send![&*self.cards[idx].overlay, setHidden: false];
+                    let () = msg_send![&*self.cards[idx].fav_button, setHidden: false];
+                }
+                self.update_card_border(idx);
+            }
+        }
+    }
+
+    fn update_card_border(&self, index: usize) {
         if index >= self.cards.len() {
             return;
         }
-        let card = &self.cards[index];
+        let active = index == self.active_index;
+        let hovered = self.hovered == Some(index);
         unsafe {
-            let layer: *mut AnyObject = msg_send![&*card.view, layer];
+            let layer: *mut AnyObject = msg_send![&*self.cards[index].view, layer];
             if active {
                 let border: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 0.2, green: 0.55, blue: 1.0, alpha: 1.0];
                 let cg: *mut CGColor = msg_send![&*border, CGColor];
                 let () = msg_send![layer, setBorderColor: cg];
                 let () = msg_send![layer, setBorderWidth: 3.0];
+            } else if hovered {
+                let border: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedRed: 1.0, green: 1.0, blue: 1.0, alpha: 0.85];
+                let cg: *mut CGColor = msg_send![&*border, CGColor];
+                let () = msg_send![layer, setBorderColor: cg];
+                let () = msg_send![layer, setBorderWidth: 2.0];
             } else {
                 let () = msg_send![layer, setBorderWidth: 0.0];
             }
@@ -1223,13 +1247,9 @@ impl Gallery {
     #[allow(dead_code)]
     pub fn update_favorites(&mut self, favorites: &HashSet<String>) {
         self.favorites = favorites.clone();
-        for (i, name) in self.all_presets.iter().enumerate() {
-            let is_fav = favorites.contains(name);
-            unsafe {
-                let star = if is_fav { "\u{2605}" } else { "\u{2606}" };
-                let () =
-                    msg_send![&*self.cards[i].fav_button, setTitle: &*NSString::from_str(star)];
-            }
+        for i in 0..self.all_presets.len() {
+            let is_fav = favorites.contains(&self.all_presets[i]);
+            self.apply_card_favorite(i, is_fav);
         }
     }
 
@@ -1244,12 +1264,26 @@ impl Gallery {
             self.favorites.insert(name.clone());
         }
         let is_fav = self.favorites.contains(name);
-        unsafe {
-            let star = if is_fav { "\u{2605}" } else { "\u{2606}" };
-            let () = msg_send![&*self.cards[preset_index].fav_button, setTitle: &*NSString::from_str(star)];
-        }
+        self.apply_card_favorite(preset_index, is_fav);
         if self.show_favorites_only {
             self.relayout();
+        }
+    }
+
+    fn apply_card_favorite(&mut self, index: usize, is_fav: bool) {
+        if index >= self.cards.len() {
+            return;
+        }
+        self.cards[index].is_favorite = is_fav;
+        let hovered = self.hovered == Some(index);
+        unsafe {
+            let star = if is_fav { "\u{2605}" } else { "\u{2606}" };
+            let () =
+                msg_send![&*self.cards[index].fav_button, setTitle: &*NSString::from_str(star)];
+            let () =
+                msg_send![&*self.cards[index].fav_button, setContentTintColor: &*fav_tint(is_fav)];
+            // Favorites stay visible; non-favorites hide again unless currently hovered.
+            let () = msg_send![&*self.cards[index].fav_button, setHidden: !(is_fav || hovered)];
         }
     }
 }

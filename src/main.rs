@@ -532,6 +532,7 @@ fn main() {
                 // Keep chrome/grid layout in sync during live resize even when the mouse
                 // is hovering a card and thumbnail preview rendering is paused.
                 g.sync_layout_to_bounds();
+                g.update_hover(hover);
             }
             if g.is_open() && !hover_active {
                 g.tick(&viz);
