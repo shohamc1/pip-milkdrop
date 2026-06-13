@@ -1,42 +1,105 @@
+use std::ffi::{CStr, CString};
+use std::path::Path;
+
 use crate::ffi;
 
+/// Safe wrapper over a projectM 4.x instance. The main visualizer also owns a connected
+/// playlist that drives index-based preset navigation; lightweight preview-pool instances
+/// (`new_thumbnail`) have no playlist and load presets directly by file path.
 pub struct Visualizer {
-    handle: ffi::pm_handle,
+    handle: ffi::projectm_handle,
+    playlist: ffi::projectm_playlist_handle,
 }
 
 impl Visualizer {
     pub fn new(width: u32, height: u32, preset_path: &str) -> Result<Self, String> {
-        let c_preset = std::ffi::CString::new(preset_path).map_err(|e| e.to_string())?;
-        let c_datadir =
-            std::ffi::CString::new(env!("PROJECTM_DATADIR")).map_err(|e| e.to_string())?;
-
-        let handle = unsafe {
-            ffi::pm_create(
-                48,
-                36,
-                60,
-                1024,
-                width as i32,
-                height as i32,
-                c_preset.as_ptr(),
-                c_datadir.as_ptr(),
-                10,
-                15,
-                1.0,
-            )
-        };
-
+        let handle = unsafe { ffi::projectm_create() };
         if handle.is_null() {
             return Err("Failed to create projectM instance".into());
         }
+        unsafe {
+            ffi::projectm_set_window_size(handle, width as usize, height as usize);
+            ffi::projectm_set_mesh_size(handle, 48, 32);
+            ffi::projectm_set_fps(handle, 60);
+            ffi::projectm_set_aspect_correction(handle, true);
+            ffi::projectm_set_beat_sensitivity(handle, 1.0);
+            // We drive preset selection ourselves: no auto-advance, no soft-cut blend.
+            ffi::projectm_set_preset_duration(handle, 999_999.0);
+            ffi::projectm_set_soft_cut_duration(handle, 0.0);
+            ffi::projectm_set_hard_cut_enabled(handle, false);
+        }
+        let playlist = unsafe { ffi::projectm_playlist_create(handle) };
+        if playlist.is_null() {
+            unsafe { ffi::projectm_destroy(handle) };
+            return Err("Failed to create projectM playlist".into());
+        }
 
-        Ok(Self { handle })
+        let viz = Self { handle, playlist };
+        viz.add_path(preset_path);
+        viz.sort_playlist();
+        Ok(viz)
+    }
+
+    /// A lighter-weight instance for the gallery preview pool: smaller mesh/texture, no
+    /// playlist. Presets are loaded directly by path via [`load_preset_file`].
+    pub fn new_thumbnail(width: u32, height: u32) -> Result<Self, String> {
+        let handle = unsafe { ffi::projectm_create() };
+        if handle.is_null() {
+            return Err("Failed to create projectM preview instance".into());
+        }
+        unsafe {
+            ffi::projectm_set_window_size(handle, width as usize, height as usize);
+            ffi::projectm_set_mesh_size(handle, 32, 24);
+            ffi::projectm_set_fps(handle, 30);
+            ffi::projectm_set_aspect_correction(handle, true);
+            ffi::projectm_set_beat_sensitivity(handle, 1.0);
+            ffi::projectm_set_soft_cut_duration(handle, 0.0);
+            ffi::projectm_set_hard_cut_enabled(handle, false);
+        }
+        Ok(Self {
+            handle,
+            playlist: std::ptr::null_mut(),
+        })
+    }
+
+    fn add_path(&self, path: &str) {
+        if self.playlist.is_null() {
+            return;
+        }
+        if let Ok(c) = CString::new(path) {
+            unsafe { ffi::projectm_playlist_add_path(self.playlist, c.as_ptr(), true, false) };
+        }
+    }
+
+    fn sort_playlist(&self) {
+        if self.playlist.is_null() {
+            return;
+        }
+        unsafe {
+            let n = ffi::projectm_playlist_size(self.playlist);
+            ffi::projectm_playlist_sort(
+                self.playlist,
+                0,
+                n,
+                ffi::SORT_PREDICATE_FILENAME_ONLY,
+                ffi::SORT_ORDER_ASCENDING,
+            );
+        }
+    }
+
+    pub fn load_preset_file(&self, path: &str, smooth: bool) {
+        if let Ok(c) = CString::new(path) {
+            unsafe { ffi::projectm_load_preset_file(self.handle, c.as_ptr(), smooth) };
+        }
     }
 
     pub fn render_frame(&self) {
-        unsafe {
-            ffi::pm_render_frame(self.handle);
-        }
+        unsafe { ffi::projectm_opengl_render_frame(self.handle) };
+    }
+
+    #[allow(dead_code)]
+    pub fn render_frame_fbo(&self, fbo: u32) {
+        unsafe { ffi::projectm_opengl_render_frame_fbo(self.handle, fbo) };
     }
 
     #[allow(dead_code)]
@@ -45,7 +108,12 @@ impl Visualizer {
             return;
         }
         unsafe {
-            ffi::pm_add_pcm_float(self.handle, samples.as_ptr(), samples.len() as i32);
+            ffi::projectm_pcm_add_float(
+                self.handle,
+                samples.as_ptr(),
+                samples.len() as u32,
+                ffi::PROJECTM_MONO,
+            );
         }
     }
 
@@ -53,27 +121,37 @@ impl Visualizer {
         if samples.is_empty() {
             return;
         }
+        // `count` is the number of samples per channel; `samples` is interleaved LRLR.
+        let frames = (samples.len() / 2) as u32;
         unsafe {
-            ffi::pm_add_pcm_float_stereo(self.handle, samples.as_ptr(), samples.len() as i32);
+            ffi::projectm_pcm_add_float(
+                self.handle,
+                samples.as_ptr(),
+                frames,
+                ffi::PROJECTM_STEREO,
+            );
         }
     }
 
     pub fn reset_gl(&self, width: i32, height: i32) {
         unsafe {
-            ffi::pm_reset_gl(self.handle, width, height);
-        }
+            ffi::projectm_set_window_size(self.handle, width.max(0) as usize, height.max(0) as usize)
+        };
     }
 
     pub fn select_preset(&self, index: u32) {
+        if self.playlist.is_null() {
+            return;
+        }
         unsafe {
-            ffi::pm_select_preset(self.handle, index, true);
-            ffi::pm_set_preset_lock(self.handle, true);
+            ffi::projectm_playlist_set_position(self.playlist, index, true);
+            ffi::projectm_set_preset_locked(self.handle, true);
         }
     }
 
     pub fn select_next(&self) {
-        unsafe {
-            ffi::pm_select_next(self.handle, true);
+        if !self.playlist.is_null() {
+            unsafe { ffi::projectm_playlist_play_next(self.playlist, true) };
         }
     }
 
@@ -90,70 +168,85 @@ impl Visualizer {
     }
 
     pub fn select_previous(&self) {
-        unsafe {
-            ffi::pm_select_previous(self.handle, true);
+        if !self.playlist.is_null() {
+            unsafe { ffi::projectm_playlist_play_previous(self.playlist, true) };
         }
     }
 
     pub fn playlist_size(&self) -> u32 {
-        unsafe { ffi::pm_get_playlist_size(self.handle) }
+        if self.playlist.is_null() {
+            return 0;
+        }
+        unsafe { ffi::projectm_playlist_size(self.playlist) }
     }
 
-    pub fn preset_name(&self, index: u32) -> String {
+    /// Absolute file path of the preset at `index` in the playlist.
+    pub fn preset_path(&self, index: u32) -> Option<String> {
+        if self.playlist.is_null() {
+            return None;
+        }
         unsafe {
-            let ptr = ffi::pm_get_preset_name(self.handle, index);
+            let ptr = ffi::projectm_playlist_item(self.playlist, index);
             if ptr.is_null() {
-                return String::new();
+                return None;
             }
-            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            ffi::projectm_playlist_free_string(ptr);
+            Some(s)
         }
     }
 
+    /// Display name (file name) of the preset at `index`, matching the 3.x behaviour the
+    /// rest of the app (favourites, gallery labels) keys on.
+    pub fn preset_name(&self, index: u32) -> String {
+        self.preset_path(index)
+            .and_then(|p| {
+                Path::new(&p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default()
+    }
+
     pub fn load_user_presets(&self, dir: &str) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "milk" && ext != "milk2" && ext != "prjm" {
-                continue;
-            }
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let url = path.to_string_lossy().into_owned();
-            let c_url = match std::ffi::CString::new(url.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let c_name = match std::ffi::CString::new(name.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+        if self.playlist.is_null() || !Path::new(dir).is_dir() {
+            return;
+        }
+        // Append after the stock presets and sort only the newly added range, so the
+        // stock/user split (the gallery's section boundary) stays at `stock_count`.
+        let before = self.playlist_size();
+        self.add_path(dir);
+        let after = self.playlist_size();
+        if after > before {
             unsafe {
-                ffi::pm_add_preset_url(self.handle, c_url.as_ptr(), c_name.as_ptr());
+                ffi::projectm_playlist_sort(
+                    self.playlist,
+                    before,
+                    after - before,
+                    ffi::SORT_PREDICATE_FILENAME_ONLY,
+                    ffi::SORT_ORDER_ASCENDING,
+                );
             }
         }
     }
 
     pub fn selected_preset_index(&self) -> u32 {
-        unsafe {
-            let mut idx: u32 = 0;
-            ffi::pm_get_selected_preset_index(self.handle, &mut idx);
-            idx
+        if self.playlist.is_null() {
+            return 0;
         }
+        unsafe { ffi::projectm_playlist_get_position(self.playlist) }
     }
 }
 
 impl Drop for Visualizer {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
-                ffi::pm_destroy(self.handle);
+        unsafe {
+            if !self.playlist.is_null() {
+                ffi::projectm_playlist_destroy(self.playlist);
+            }
+            if !self.handle.is_null() {
+                ffi::projectm_destroy(self.handle);
             }
         }
     }

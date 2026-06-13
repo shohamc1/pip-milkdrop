@@ -25,7 +25,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask,
     NSFloatingWindowLevel, NSOpenGLContext, NSOpenGLContextParameter, NSOpenGLPFAAlphaSize,
     NSOpenGLPFAColorSize, NSOpenGLPFADepthSize, NSOpenGLPFADoubleBuffer, NSOpenGLPFAOpenGLProfile,
-    NSOpenGLPixelFormat, NSOpenGLProfileVersion3_2Core, NSView, NSWindow, NSWindowStyleMask,
+    NSOpenGLPixelFormat, NSOpenGLProfileVersion4_1Core, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect};
@@ -120,7 +120,7 @@ fn main() {
 
     let attrs: Vec<u32> = vec![
         NSOpenGLPFAOpenGLProfile,
-        NSOpenGLProfileVersion3_2Core,
+        NSOpenGLProfileVersion4_1Core,
         NSOpenGLPFADoubleBuffer,
         NSOpenGLPFAColorSize,
         24,
