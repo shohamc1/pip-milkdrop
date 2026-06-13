@@ -1235,33 +1235,6 @@ impl Gallery {
         }
     }
 
-    pub fn set_card_image(&self, idx: usize, image: &AnyObject) {
-        if idx < self.cards.len() {
-            unsafe {
-                let () = msg_send![&*self.cards[idx].image_view, setImage: image];
-            }
-        }
-    }
-
-    pub fn render_hover_frame(
-        &mut self,
-        viz: &Visualizer,
-        preset_idx: usize,
-    ) -> Option<Retained<AnyObject>> {
-        let saved_preset = viz.selected_preset_index();
-        viz.select_preset(preset_idx as u32);
-
-        for _ in 0..FRAMES_PER_TICK {
-            let pcm = generate_simulated_audio(&mut self.sim_time);
-            viz.add_pcm_float_stereo(&pcm);
-            viz.render_frame();
-        }
-
-        let image = capture_gl_image();
-        viz.select_preset(saved_preset);
-        image
-    }
-
     pub fn get_search_text(&self) -> String {
         unsafe {
             let s: Retained<NSString> = msg_send![&*self.search_field, stringValue];

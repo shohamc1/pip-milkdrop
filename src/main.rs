@@ -490,7 +490,6 @@ fn main() {
 
         let gallery_open = gallery.as_ref().map_or(false, |g| g.is_open());
         let hover = gallery::GALLERY_HOVER.load(Ordering::Relaxed);
-        let hover_active = gallery_open && hover >= 0;
 
         let activity_present = latest_rms >= config.rms_threshold() || media_playing;
         if !activity_present {
@@ -529,29 +528,18 @@ fn main() {
 
         if let Some(ref mut g) = gallery {
             if g.is_open() {
-                // Keep chrome/grid layout in sync during live resize even when the mouse
-                // is hovering a card and thumbnail preview rendering is paused.
                 g.sync_layout_to_bounds();
+                // Update the hover overlay (name/star/border); the live preview pool
+                // animates every visible card, including the hovered one.
                 g.update_hover(hover);
-            }
-            if g.is_open() && !hover_active {
                 g.tick(&viz);
             }
         }
 
-        if hover_active {
-            let hover_idx = hover as usize;
-            if let Some(ref mut g) = gallery {
-                if let Some(image) = g.render_hover_frame(&viz, hover_idx) {
-                    g.set_card_image(hover_idx, &image);
-                }
-            }
-        }
-
-        if visible && !hover_active {
+        if visible {
             viz.render_frame();
             ctx.flushBuffer();
-        } else if !gallery_open && !hover_active {
+        } else if !gallery_open {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
