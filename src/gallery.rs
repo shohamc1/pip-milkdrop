@@ -286,6 +286,10 @@ struct SectionInfo {
     count: usize,
 }
 
+struct ScrollAnchor {
+    preset_index: usize,
+}
+
 pub struct Gallery {
     window: Retained<NSWindow>,
     #[allow(dead_code)]
@@ -322,6 +326,7 @@ pub struct Gallery {
     initial_queued: HashSet<usize>,
     last_layout_w: f64,
     last_layout_h: f64,
+    last_scroll_anchor: Option<usize>,
 }
 
 impl Gallery {
@@ -507,8 +512,8 @@ impl Gallery {
             let sv: *mut AnyObject = msg_send![sv, initWithFrame: scroll_rect];
             let sv = Retained::from_raw(sv).unwrap();
             let () = msg_send![&*sv, setHasVerticalScroller: true];
-            let () = msg_send![&*sv, setAutohidesScrollers: false];
-            let () = msg_send![&*sv, setScrollerStyle: 0isize]; // NSScrollerStyleLegacy: always visible, avoids hidden overlay affordance.
+            let () = msg_send![&*sv, setAutohidesScrollers: true];
+            let () = msg_send![&*sv, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay: hide until the user scrolls.
             let () = msg_send![&*sv, setAutoresizingMask: 0usize];
             sv
         };
@@ -690,6 +695,7 @@ impl Gallery {
             initial_queued: HashSet::new(),
             last_layout_w: 0.0,
             last_layout_h: 0.0,
+            last_scroll_anchor: None,
         };
 
         gallery.layout_chrome();
@@ -939,12 +945,68 @@ impl Gallery {
     }
 
     pub fn sync_layout_to_bounds(&mut self) {
+        let current_anchor = self.scroll_anchor();
         self.layout_chrome();
         let bounds: CGRect = unsafe { msg_send![&*self.scroll_view, frame] };
-        if (bounds.size.width - self.last_layout_w).abs() > 0.5
-            || (bounds.size.height - self.last_layout_h).abs() > 0.5
-        {
+        let size_changed = (bounds.size.width - self.last_layout_w).abs() > 0.5
+            || (bounds.size.height - self.last_layout_h).abs() > 0.5;
+
+        if size_changed {
+            // Use the last stable anchor captured before AppKit started resizing the
+            // scroll view. During live resize the clip view may already have shifted,
+            // so re-reading the current visible rect can anchor to the wrong row.
+            let anchor = self
+                .last_scroll_anchor
+                .map(|preset_index| ScrollAnchor { preset_index })
+                .or(current_anchor);
             self.relayout();
+            if let Some(anchor) = anchor {
+                let preset_index = anchor.preset_index;
+                self.restore_scroll_anchor(anchor);
+                self.last_scroll_anchor = Some(preset_index);
+            }
+        } else {
+            self.last_scroll_anchor = current_anchor.map(|anchor| anchor.preset_index);
+        }
+    }
+
+    fn scroll_anchor(&self) -> Option<ScrollAnchor> {
+        let clip_view: Retained<AnyObject> = unsafe { msg_send![&*self.scroll_view, contentView] };
+        let clip_bounds: CGRect = unsafe { msg_send![&*clip_view, bounds] };
+        let visible_bottom = clip_bounds.origin.y;
+        let visible_top = clip_bounds.origin.y + clip_bounds.size.height;
+
+        self.visible_indices
+            .iter()
+            .copied()
+            .find(|&preset_index| {
+                if preset_index >= self.cards.len() {
+                    return false;
+                }
+                let frame: CGRect = unsafe { msg_send![&*self.cards[preset_index].view, frame] };
+                let card_bottom = frame.origin.y;
+                let card_top = frame.origin.y + frame.size.height;
+                let visible_h = card_top.min(visible_top) - card_bottom.max(visible_bottom);
+                let visible_ratio = (visible_h / frame.size.height).clamp(0.0, 1.0);
+                visible_ratio >= 0.30
+            })
+            .map(|preset_index| ScrollAnchor { preset_index })
+    }
+
+    fn restore_scroll_anchor(&self, anchor: ScrollAnchor) {
+        if anchor.preset_index >= self.cards.len() {
+            return;
+        }
+        unsafe {
+            let clip_view: Retained<AnyObject> = msg_send![&*self.scroll_view, contentView];
+            let clip_bounds: CGRect = msg_send![&*clip_view, bounds];
+            let doc_frame: CGRect = msg_send![&*self.document_view, frame];
+            let card_frame: CGRect = msg_send![&*self.cards[anchor.preset_index].view, frame];
+            let max_y = (doc_frame.size.height - clip_bounds.size.height).max(0.0);
+            let target_y = (card_frame.origin.y + card_frame.size.height - clip_bounds.size.height)
+                .clamp(0.0, max_y);
+            let () = msg_send![&*clip_view, scrollToPoint: CGPoint::new(0.0, target_y)];
+            let () = msg_send![&*self.scroll_view, reflectScrolledClipView: &*clip_view];
         }
     }
 
