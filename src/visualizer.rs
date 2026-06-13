@@ -135,7 +135,11 @@ impl Visualizer {
 
     pub fn reset_gl(&self, width: i32, height: i32) {
         unsafe {
-            ffi::projectm_set_window_size(self.handle, width.max(0) as usize, height.max(0) as usize)
+            ffi::projectm_set_window_size(
+                self.handle,
+                width.max(0) as usize,
+                height.max(0) as usize,
+            )
         };
     }
 

@@ -37,6 +37,10 @@ const LABEL_PAD: f64 = 9.0;
 const MIN_COLS: usize = 2;
 const WARMUP_INITIAL: usize = 8;
 const FRAMES_PER_TICK: usize = 2;
+// Live preview pool sized to cover the visible cards in a typical window; extra on-screen
+// cards fall back to their cached thumbnail.
+const POOL_SIZE: usize = 24;
+const POOL_PX: i32 = 256;
 const SECTION_HEADER_H: f64 = 28.0;
 const HEADER_PAD: f64 = 12.0;
 const SEARCH_H: f64 = 28.0;
@@ -333,6 +337,12 @@ pub struct Gallery {
     last_layout_w: f64,
     last_layout_h: f64,
     last_scroll_anchor: Option<usize>,
+
+    // Live preview pool: a fixed set of projectM 4.x instances, each pinned to one
+    // on-screen preset and rendered every frame so all visible cards animate at once.
+    pool: Vec<Visualizer>,
+    pool_assigned: Vec<usize>,
+    last_scroll_y: f64,
 }
 
 impl Gallery {
@@ -704,6 +714,9 @@ impl Gallery {
             last_layout_w: 0.0,
             last_layout_h: 0.0,
             last_scroll_anchor: None,
+            pool: Vec::new(),
+            pool_assigned: Vec::new(),
+            last_scroll_y: f64::NAN,
         };
 
         gallery.layout_chrome();
@@ -1074,12 +1087,111 @@ impl Gallery {
         }
     }
 
+    /// Preset indices whose cards currently intersect the scroll viewport, top-to-bottom.
+    fn cards_in_viewport(&self, clip_bounds: &CGRect) -> Vec<usize> {
+        let visible_bottom = clip_bounds.origin.y;
+        let visible_top = clip_bounds.origin.y + clip_bounds.size.height;
+        let mut out = Vec::new();
+        for &idx in &self.visible_indices {
+            if idx >= self.cards.len() {
+                continue;
+            }
+            let frame: CGRect = unsafe { msg_send![&*self.cards[idx].view, frame] };
+            let card_bottom = frame.origin.y;
+            let card_top = frame.origin.y + frame.size.height;
+            if card_top > visible_bottom && card_bottom < visible_top {
+                out.push(idx);
+            }
+        }
+        out
+    }
+
+    /// Drive the live preview pool: each instance is pinned to one on-screen preset and
+    /// rendered every frame. While the user is actively scrolling, cards keep their cached
+    /// thumbnails (instant, no recompiles); the pool re-binds and resumes once scrolling
+    /// settles. Identity-based assignment means only newly-visible presets are (re)loaded.
+    fn update_pool(&mut self, viz: &Visualizer) {
+        // Grow the pool one instance per tick so opening the gallery doesn't stall.
+        if self.pool.len() < POOL_SIZE {
+            if let Ok(v) = Visualizer::new_thumbnail(POOL_PX as u32, POOL_PX as u32) {
+                v.reset_gl(POOL_PX, POOL_PX);
+                self.pool.push(v);
+                self.pool_assigned.push(usize::MAX);
+            }
+        }
+        if self.pool.is_empty() {
+            return;
+        }
+
+        let clip: Retained<AnyObject> = unsafe { msg_send![&*self.scroll_view, contentView] };
+        let clip_bounds: CGRect = unsafe { msg_send![&*clip, bounds] };
+        let scroll_y = clip_bounds.origin.y;
+        let scrolling = !self.last_scroll_y.is_nan() && (scroll_y - self.last_scroll_y).abs() > 0.5;
+        self.last_scroll_y = scroll_y;
+        if scrolling {
+            return;
+        }
+
+        let want: Vec<usize> = self
+            .cards_in_viewport(&clip_bounds)
+            .into_iter()
+            .take(self.pool.len())
+            .collect();
+        let want_set: HashSet<usize> = want.iter().copied().collect();
+
+        // Free slots whose preset scrolled out, then bind newly-visible presets to free
+        // slots. `load_preset_file` compiles the preset, so this happens only for cards
+        // that just entered the viewport.
+        for slot in 0..self.pool.len() {
+            let cur = self.pool_assigned[slot];
+            if cur != usize::MAX && !want_set.contains(&cur) {
+                self.pool_assigned[slot] = usize::MAX;
+            }
+        }
+        let covered: HashSet<usize> = self
+            .pool_assigned
+            .iter()
+            .copied()
+            .filter(|&x| x != usize::MAX)
+            .collect();
+        let mut free: Vec<usize> = (0..self.pool.len())
+            .filter(|&s| self.pool_assigned[s] == usize::MAX)
+            .collect();
+        for &idx in &want {
+            if covered.contains(&idx) {
+                continue;
+            }
+            if let (Some(slot), Some(path)) = (free.last().copied(), viz.preset_path(idx as u32)) {
+                self.pool[slot].load_preset_file(&path, false);
+                self.pool_assigned[slot] = idx;
+                free.pop();
+            }
+        }
+
+        // Render every bound slot and push the fresh frame onto its card.
+        for slot in 0..self.pool.len() {
+            let idx = self.pool_assigned[slot];
+            if idx == usize::MAX || idx >= self.cards.len() {
+                continue;
+            }
+            let pcm = generate_simulated_audio(&mut self.sim_time);
+            self.pool[slot].add_pcm_float_stereo(&pcm);
+            self.pool[slot].render_frame();
+            if let Some(image) = capture_gl_image() {
+                unsafe {
+                    let () = msg_send![&*self.cards[idx].image_view, setImage: &*image];
+                }
+            }
+        }
+    }
+
     pub fn tick(&mut self, viz: &Visualizer) {
         if !self.is_open {
             return;
         }
 
         self.sync_layout_to_bounds();
+        self.update_pool(viz);
 
         if self.current_preview.is_none() {
             if self.initial_queue.is_empty() {
