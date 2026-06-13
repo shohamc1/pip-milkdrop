@@ -41,6 +41,13 @@ const FRAMES_PER_TICK: usize = 2;
 // cards fall back to their cached thumbnail.
 const POOL_SIZE: usize = 24;
 const POOL_PX: i32 = 256;
+// Per-frame work is bounded so the main loop stays responsive: only a few instances are
+// rendered (round-robin) and a few presets compiled each frame.
+const POOL_RENDER_PER_FRAME: usize = 6;
+const POOL_LOADS_PER_FRAME: usize = 2;
+// Frames of no scroll movement before the pool resumes, so momentum-scroll gaps don't
+// trigger an expensive render mid-scroll.
+const SCROLL_SETTLE_FRAMES: u32 = 5;
 const SECTION_HEADER_H: f64 = 28.0;
 const HEADER_PAD: f64 = 12.0;
 const SEARCH_H: f64 = 28.0;
@@ -343,6 +350,8 @@ pub struct Gallery {
     pool: Vec<Visualizer>,
     pool_assigned: Vec<usize>,
     last_scroll_y: f64,
+    scroll_idle: u32,
+    pool_cursor: usize,
 }
 
 impl Gallery {
@@ -717,6 +726,8 @@ impl Gallery {
             pool: Vec::new(),
             pool_assigned: Vec::new(),
             last_scroll_y: f64::NAN,
+            scroll_idle: 0,
+            pool_cursor: 0,
         };
 
         gallery.layout_chrome();
@@ -1110,7 +1121,9 @@ impl Gallery {
     /// rendered every frame. While the user is actively scrolling, cards keep their cached
     /// thumbnails (instant, no recompiles); the pool re-binds and resumes once scrolling
     /// settles. Identity-based assignment means only newly-visible presets are (re)loaded.
-    fn update_pool(&mut self, viz: &Visualizer) {
+    /// Returns `true` while the user is (or just was) scrolling, so the caller can skip
+    /// other per-frame work too.
+    fn update_pool(&mut self, viz: &Visualizer) -> bool {
         // Grow the pool one instance per tick so opening the gallery doesn't stall.
         if self.pool.len() < POOL_SIZE {
             if let Ok(v) = Visualizer::new_thumbnail(POOL_PX as u32, POOL_PX as u32) {
@@ -1120,16 +1133,23 @@ impl Gallery {
             }
         }
         if self.pool.is_empty() {
-            return;
+            return false;
         }
 
         let clip: Retained<AnyObject> = unsafe { msg_send![&*self.scroll_view, contentView] };
         let clip_bounds: CGRect = unsafe { msg_send![&*clip, bounds] };
         let scroll_y = clip_bounds.origin.y;
-        let scrolling = !self.last_scroll_y.is_nan() && (scroll_y - self.last_scroll_y).abs() > 0.5;
+        let moved = self.last_scroll_y.is_nan() || (scroll_y - self.last_scroll_y).abs() > 0.5;
         self.last_scroll_y = scroll_y;
-        if scrolling {
-            return;
+        if moved {
+            self.scroll_idle = 0;
+        } else {
+            self.scroll_idle = self.scroll_idle.saturating_add(1);
+        }
+        // Keep cached thumbnails (no compiles, no renders) until scrolling has settled, so
+        // momentum-scroll gaps never trigger an expensive frame mid-scroll.
+        if self.scroll_idle < SCROLL_SETTLE_FRAMES {
+            return true;
         }
 
         let want: Vec<usize> = self
@@ -1140,8 +1160,8 @@ impl Gallery {
         let want_set: HashSet<usize> = want.iter().copied().collect();
 
         // Free slots whose preset scrolled out, then bind newly-visible presets to free
-        // slots. `load_preset_file` compiles the preset, so this happens only for cards
-        // that just entered the viewport.
+        // slots. `load_preset_file` compiles the preset, so it is capped per frame to
+        // spread the cost when settling on a fresh area.
         for slot in 0..self.pool.len() {
             let cur = self.pool_assigned[slot];
             if cur != usize::MAX && !want_set.contains(&cur) {
@@ -1157,19 +1177,28 @@ impl Gallery {
         let mut free: Vec<usize> = (0..self.pool.len())
             .filter(|&s| self.pool_assigned[s] == usize::MAX)
             .collect();
+        let mut loads = 0usize;
         for &idx in &want {
             if covered.contains(&idx) {
                 continue;
+            }
+            if loads >= POOL_LOADS_PER_FRAME {
+                break;
             }
             if let (Some(slot), Some(path)) = (free.last().copied(), viz.preset_path(idx as u32)) {
                 self.pool[slot].load_preset_file(&path, false);
                 self.pool_assigned[slot] = idx;
                 free.pop();
+                loads += 1;
             }
         }
 
-        // Render every bound slot and push the fresh frame onto its card.
-        for slot in 0..self.pool.len() {
+        // Render a rotating window of bound slots so per-frame readback stays bounded;
+        // each card refreshes every few frames.
+        let n = self.pool.len();
+        let render_count = POOL_RENDER_PER_FRAME.min(n);
+        for k in 0..render_count {
+            let slot = (self.pool_cursor + k) % n;
             let idx = self.pool_assigned[slot];
             if idx == usize::MAX || idx >= self.cards.len() {
                 continue;
@@ -1183,6 +1212,8 @@ impl Gallery {
                 }
             }
         }
+        self.pool_cursor = (self.pool_cursor + render_count) % n;
+        false
     }
 
     pub fn tick(&mut self, viz: &Visualizer) {
@@ -1191,7 +1222,11 @@ impl Gallery {
         }
 
         self.sync_layout_to_bounds();
-        self.update_pool(viz);
+        // While scrolling, do nothing beyond keeping layout in sync: cards stay on their
+        // cached thumbnails and no preset is rendered, so scrolling stays smooth.
+        if self.update_pool(viz) {
+            return;
+        }
 
         if self.current_preview.is_none() {
             if self.initial_queue.is_empty() {
